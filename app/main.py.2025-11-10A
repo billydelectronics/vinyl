@@ -1,0 +1,537 @@
+from __future__ import annotations
+
+import os
+import sqlite3
+import time
+from typing import Any, Dict, List, Optional
+
+from fastapi import Body, FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# =============================================================================
+# Config
+# =============================================================================
+
+DB_PATH = os.environ.get("VINYL_DB", "/app/data/records.db")
+
+DISCOGS_API = "https://api.discogs.com"
+DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")  # optional
+USER_AGENT = os.environ.get("USER_AGENT", "VinylRecordTracker/1.0")
+REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "20"))
+
+app = FastAPI(title="Vinyl API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # tighten for prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"ok": True, "service": "vinyl-api", "db": DB_PATH}
+
+@app.get("/healthz")
+def healthz() -> Dict[str, Any]:
+    return {"status": "ok", "ts": int(time.time())}
+
+@app.get("/health")
+def health_root() -> Dict[str, Any]:
+    return {"status": "ok"}
+
+@app.get("/api/health")
+def api_health() -> Dict[str, Any]:
+    return {"status": "ok"}
+
+# =============================================================================
+# DB helpers
+# =============================================================================
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    # Ensure foreign keys are enforced for this connection
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+    except Exception:
+        pass
+    return conn
+
+def init_db() -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          artist TEXT,
+          title TEXT,
+          year INTEGER,
+          label TEXT,
+          format TEXT,
+          country TEXT,
+          catalog_number TEXT,
+          barcode TEXT,
+          discogs_id INTEGER,
+          discogs_release_id INTEGER,
+          discogs_thumb TEXT,
+          cover_url TEXT,
+          cover_local TEXT,
+          cover_url_auto TEXT,
+          album_notes TEXT,
+          personal_notes TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tracks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+          side TEXT,
+          position TEXT,
+          title TEXT,
+          duration TEXT
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+@app.on_event("startup")
+def on_startup() -> None:
+    folder = os.path.dirname(DB_PATH) or "."
+    os.makedirs(folder, exist_ok=True)
+    init_db()
+
+def fetch_record(conn: sqlite3.Connection, rid: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM records WHERE id = ?", (rid,)).fetchone()
+    if not row:
+        raise HTTPException(404, detail="Record not found")
+    return row
+
+def db_get_record_or_404(rid: int) -> Dict[str, Any]:
+    conn = db()
+    row = fetch_record(conn, rid)
+    out = dict(row)
+    conn.close()
+    return out
+
+def db_patch_record(rid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not payload:
+        return db_get_record_or_404(rid)
+    conn = db()
+    cur = conn.cursor()
+    cols, vals = [], []
+    for k, v in payload.items():
+        cols.append(f"{k} = ?")
+        vals.append(v)
+    cols.append("updated_at = CURRENT_TIMESTAMP")
+    cur.execute(f"UPDATE records SET {', '.join(cols)} WHERE id = ?", (*vals, rid))
+    conn.commit()
+    row = fetch_record(conn, rid)
+    out = dict(row)
+    conn.close()
+    return out
+
+def db_insert_record(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = db()
+    cur = conn.cursor()
+    keys = list(payload.keys())
+    vals = [payload[k] for k in keys]
+    placeholders = ", ".join("?" for _ in keys)
+    cur.execute(
+        f"INSERT INTO records ({', '.join(keys)}) VALUES ({placeholders})",
+        tuple(vals),
+    )
+    rid = cur.lastrowid
+    conn.commit()
+    row = fetch_record(conn, rid)
+    out = dict(row)
+    conn.close()
+    return out
+
+def db_get_tracks(rid: int) -> List[Dict[str, Any]]:
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, record_id, side, position, title, duration FROM tracks WHERE record_id = ? ORDER BY id",
+        (rid,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def db_replace_tracks(rid: int, tracks: List[Dict[str, Any]]) -> None:
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
+    for t in tracks:
+        cur.execute(
+            "INSERT INTO tracks (record_id, side, position, title, duration) VALUES (?, ?, ?, ?, ?)",
+            (rid, t.get("side"), t.get("position"), t.get("title"), t.get("duration")),
+        )
+    conn.commit()
+    conn.close()
+
+def bump_record_updated(rid: int) -> None:
+    conn = db()
+    conn.execute("UPDATE records SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (rid,))
+    conn.commit()
+    conn.close()
+
+# =============================================================================
+# Discogs helpers
+# =============================================================================
+
+def _discogs_headers() -> Dict[str, str]:
+    h = {"User-Agent": USER_AGENT}
+    if DISCOGS_TOKEN:
+        h["Authorization"] = f"Discogs token={DISCOGS_TOKEN}"
+    return h
+
+def _http_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    try:
+        import requests
+    except Exception as e:
+        raise HTTPException(500, detail=f"'requests' not installed: {e}")
+    r = requests.get(url, params=params, headers=_discogs_headers(), timeout=REQUEST_TIMEOUT)
+    if r.status_code == 404:
+        raise HTTPException(404, detail="Discogs resource not found")
+    r.raise_for_status()
+    return r.json()
+
+def discogs_release_details(release_id: int) -> Dict[str, Any]:
+    return _http_get(f"{DISCOGS_API}/releases/{release_id}")
+
+def discogs_search_release(
+    artist: str = "",
+    title: str = "",
+    year: Optional[int] = None,
+    label: Optional[str] = None,
+    barcode: Optional[str] = None,
+    catalog_number: Optional[str] = None,
+    format_filter: str = "Vinyl",
+) -> Dict[str, Any]:
+    params: Dict[str, Any] = {
+        "type": "release",
+        "format": format_filter,
+        "per_page": 10,
+        "page": 1,
+    }
+    if artist:
+        params["artist"] = artist
+    if title:
+        params["release_title"] = title
+    if year:
+        params["year"] = year
+    if label:
+        params["label"] = label
+    if barcode:
+        params["barcode"] = barcode
+    if catalog_number:
+        params["catno"] = catalog_number
+    return _http_get(f"{DISCOGS_API}/database/search", params)
+
+def pick_best_discogs_release(
+    artist: str,
+    title: str,
+    year: Optional[int],
+    label: Optional[str],
+    barcode: Optional[str],
+    catno: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    if barcode or catno:
+        js = discogs_search_release(artist=artist, title=title, year=year, label=label, barcode=barcode, catalog_number=catno)
+        if js.get("results"):
+            return js["results"][0]
+    js2 = discogs_search_release(artist=artist, title=title, year=year, label=label)
+    return (js2.get("results") or [None])[0]
+
+def discogs_fetch_cover_for_release(release_id: int) -> Dict[str, Optional[str]]:
+    detail = discogs_release_details(release_id)
+    images = detail.get("images") or []
+    primary = next((im for im in images if (im.get("type") or "").lower() == "primary"), None)
+    cover_url_auto = primary.get("uri") if primary and primary.get("uri") else (images[0].get("uri") if images else None)
+    return {"cover_url_auto": cover_url_auto, "discogs_thumb": None}
+
+def discogs_fetch_tracklist_for_release(release_id: int) -> List[Dict[str, Any]]:
+    detail = discogs_release_details(release_id)
+    out: List[Dict[str, Any]] = []
+    for t in detail.get("tracklist", []) or []:
+        pos = (t.get("position") or "").strip()
+        title = (t.get("title") or "").strip()
+        duration = (t.get("duration") or "").strip()
+        side = "A"
+        if pos and pos[0].isalpha():
+            side = pos[0].upper()
+        out.append({"position": pos, "title": title, "duration": duration, "side": side})
+    return out
+
+def derive_best_release_id_for_record(rid: int) -> Optional[int]:
+    conn = db()
+    row = fetch_record(conn, rid)
+    artist = (row["artist"] or "").strip()
+    title = (row["title"] or "").strip()
+    year = row["year"]
+    label = row["label"]
+    catno = row["catalog_number"]
+    barcode = row["barcode"]
+    conn.close()
+    best = pick_best_discogs_release(artist, title, year, label, barcode, catno)
+    if not best:
+        return None
+    try:
+        return int(best.get("id"))
+    except Exception:
+        return None
+
+# =============================================================================
+# Models
+# =============================================================================
+
+class RecordCreate(BaseModel):
+    artist: Optional[str] = None
+    title: Optional[str] = None
+    year: Optional[int] = None
+    label: Optional[str] = None
+    format: Optional[str] = None
+    country: Optional[str] = None
+    catalog_number: Optional[str] = None
+    barcode: Optional[str] = None
+    discogs_id: Optional[int] = None
+    discogs_release_id: Optional[int] = None
+    discogs_thumb: Optional[str] = None
+    cover_url: Optional[str] = None
+    cover_local: Optional[str] = None
+    cover_url_auto: Optional[str] = None
+    album_notes: Optional[str] = None
+    personal_notes: Optional[str] = None
+
+class RecordPatch(RecordCreate):
+    pass
+
+class DiscogsApplyIn(BaseModel):
+    release_id: Optional[int] = Field(None, description="Discogs release id to force")
+
+# NEW: track editing payloads
+class TrackIn(BaseModel):
+    side: Optional[str] = None
+    position: Optional[str] = None
+    title: str
+    duration: Optional[str] = None
+
+class TracksReplaceIn(BaseModel):
+    tracks: List[TrackIn] = Field(default_factory=list)
+
+# NEW: bulk delete payload
+class BulkDeleteIn(BaseModel):
+    ids: List[int] = Field(default_factory=list)
+
+# =============================================================================
+# API: records list + create + schema
+# =============================================================================
+
+@app.get("/api/records")
+def api_list_records(
+    q: Optional[str] = Query(None, description="search text across artist/title/label/catalog_number/barcode"),
+    sort: str = Query("updated_at", pattern="^(id|artist|title|year|label|updated_at)$"),
+    order: str = Query("desc", pattern="^(asc|desc)$"),
+    limit: int = Query(100, ge=1, le=500),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    sql = "SELECT * FROM records"
+    args: List[Any] = []
+    if q:
+        sql += " WHERE (artist LIKE ? OR title LIKE ? OR label LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)"
+        like = f"%{q}%"
+        args.extend([like, like, like, like, like])
+    sql += f" ORDER BY {sort} {order.upper()} LIMIT ? OFFSET ?"
+    args.extend([limit, offset])
+    conn = db()
+    rows = conn.execute(sql, tuple(args)).fetchall()
+    if q:
+        cnt = conn.execute(
+            "SELECT COUNT(*) as c FROM records WHERE (artist LIKE ? OR title LIKE ? OR label LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)",
+            (like, like, like, like, like),
+        ).fetchone()["c"]
+    else:
+        cnt = conn.execute("SELECT COUNT(*) as c FROM records").fetchone()["c"]
+    conn.close()
+    return {"items": [dict(r) for r in rows], "count": cnt, "limit": limit, "offset": offset}
+
+@app.post("/api/records")
+def api_create_record(payload: RecordCreate) -> Dict[str, Any]:
+    data = {k: v for k, v in payload.dict().items()}
+    for k in ("artist", "title"):
+        data.setdefault(k, None)
+    created = db_insert_record(data)
+    return created
+
+@app.get("/api/meta/records/schema")
+def api_records_schema() -> Dict[str, Any]:
+    fields = [
+        {"name": "artist", "type": "text"},
+        {"name": "title", "type": "text"},
+        {"name": "year", "type": "number"},
+        {"name": "label", "type": "text"},
+        {"name": "format", "type": "text"},
+        {"name": "country", "type": "text"},
+        {"name": "catalog_number", "type": "text"},
+        {"name": "barcode", "type": "text"},
+        {"name": "discogs_id", "type": "number"},
+        {"name": "discogs_release_id", "type": "number"},
+        {"name": "discogs_thumb", "type": "text"},
+        {"name": "cover_url", "type": "text"},
+        {"name": "cover_local", "type": "text"},
+        {"name": "cover_url_auto", "type": "text"},
+        {"name": "album_notes", "type": "textarea"},
+        {"name": "personal_notes", "type": "textarea"},
+        {"name": "created_at", "type": "text"},
+        {"name": "updated_at", "type": "text"},
+    ]
+    return {"fields": fields}
+
+# =============================================================================
+# API: record detail/patch/delete
+# =============================================================================
+
+@app.get("/api/records/{rid}")
+def api_get_record(rid: int) -> Dict[str, Any]:
+    return db_get_record_or_404(rid)
+
+@app.patch("/api/records/{rid}")
+def api_patch_record(rid: int, payload: RecordPatch) -> Dict[str, Any]:
+    data = {k: v for k, v in payload.dict().items() if v is not None}
+    return db_patch_record(rid, data)
+
+@app.delete("/api/records/{rid}", status_code=204)
+def api_delete_record(rid: int) -> None:
+    # Explicitly delete tracks (in addition to foreign key cascade, for safety)
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
+    cur.execute("DELETE FROM records WHERE id = ?", (rid,))
+    if cur.rowcount == 0:
+        conn.commit()
+        conn.close()
+        raise HTTPException(404, detail="Record not found")
+    conn.commit()
+    conn.close()
+    return None
+
+@app.post("/api/records/bulk/delete")
+def api_bulk_delete_records(body: BulkDeleteIn) -> Dict[str, Any]:
+    ids = list({int(i) for i in (body.ids or []) if isinstance(i, int)})
+    if not ids:
+        return {"ok": True, "deleted": 0}
+    conn = db()
+    cur = conn.cursor()
+    # Remove tracks first for reliability (plus FKs)
+    cur.executemany("DELETE FROM tracks WHERE record_id = ?", [(i,) for i in ids])
+    cur.executemany("DELETE FROM records WHERE id = ?", [(i,) for i in ids])
+    conn.commit()
+    # count how many actually gone
+    remaining = cur.execute(
+        f"SELECT COUNT(*) AS c FROM records WHERE id IN ({','.join('?' for _ in ids)})",
+        ids
+    ).fetchone()["c"]
+    conn.close()
+    return {"ok": True, "deleted": len(ids) - int(remaining)}
+
+# =============================================================================
+# API: tracks
+# =============================================================================
+
+@app.get("/api/records/{rid}/tracks")
+def api_get_tracks(rid: int) -> List[Dict[str, Any]]:
+    _ = db_get_record_or_404(rid)
+    return db_get_tracks(rid)
+
+# replace tracks with client-provided list (manual editing)
+@app.post("/api/records/{rid}/tracks/replace")
+def api_tracks_replace(rid: int, body: TracksReplaceIn) -> Dict[str, Any]:
+    _ = db_get_record_or_404(rid)
+    items = [{"side": t.side, "position": t.position, "title": t.title, "duration": t.duration} for t in body.tracks]
+    db_replace_tracks(rid, items)
+    bump_record_updated(rid)
+    return {"ok": True, "count": len(items)}
+
+# =============================================================================
+# API: Discogs cover + tracks
+# =============================================================================
+
+@app.post("/api/records/{rid}/cover/fetch")
+def api_cover_fetch(rid: int, body: Optional[DiscogsApplyIn] = Body(None)) -> Dict[str, Any]:
+    _ = db_get_record_or_404(rid)
+    if body and body.release_id:
+        release_id = int(body.release_id)
+        cover = discogs_fetch_cover_for_release(release_id)
+    else:
+        release_id = derive_best_release_id_for_record(rid)
+        if not release_id:
+            raise HTTPException(404, detail="No suitable Discogs release found")
+        cover = discogs_fetch_cover_for_release(release_id)
+
+    payload: Dict[str, Any] = {
+        "discogs_release_id": release_id,
+        "cover_url_auto": cover.get("cover_url_auto"),
+    }
+    if cover.get("discogs_thumb"):
+        payload["discogs_thumb"] = cover["discogs_thumb"]
+
+    updated = db_patch_record(rid, payload)
+    return updated
+
+@app.post("/api/records/{rid}/tracks/save")
+def api_tracks_save(rid: int, body: Optional[DiscogsApplyIn] = Body(None)) -> Dict[str, Any]:
+    _ = db_get_record_or_404(rid)
+    if body and body.release_id:
+        release_id = int(body.release_id)
+    else:
+        release_id = derive_best_release_id_for_record(rid)
+    if not release_id:
+        raise HTTPException(404, detail="No suitable Discogs release found")
+
+    tracks = discogs_fetch_tracklist_for_release(release_id)
+    db_replace_tracks(rid, tracks)
+    bump_record_updated(rid)
+    return {"ok": True, "count": len(tracks)}
+
+# =============================================================================
+# API: Discogs search helpers used by the picker UI
+# =============================================================================
+
+@app.get("/api/records/{rid}/discogs/search")
+def api_discogs_search_for_record(rid: int) -> Dict[str, Any]:
+    row = db_get_record_or_404(rid)
+    js = discogs_search_release(
+        artist=(row.get("artist") or ""),
+        title=(row.get("title") or ""),
+        year=row.get("year"),
+        label=row.get("label"),
+        barcode=row.get("barcode"),
+        catalog_number=row.get("catalog_number"),
+    )
+    out = []
+    for r in js.get("results") or []:
+        out.append({
+            "id": r.get("id"),
+            "title": r.get("title"),
+            "year": r.get("year"),
+            "country": r.get("country"),
+            "label": r.get("label"),
+            "format": r.get("format"),
+            "thumb": r.get("thumb"),
+        })
+    return {"results": out}
+
+@app.get("/api/discogs/release/{release_id}")
+def api_discogs_release_preview(release_id: int) -> Dict[str, Any]:
+    return discogs_release_details(release_id)

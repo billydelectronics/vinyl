@@ -1,0 +1,642 @@
+import os
+import json
+import sqlite3
+from typing import Dict, List, Optional, Any, Tuple
+
+import requests
+from fastapi import FastAPI, HTTPException, Body
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# --------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL", "/data/records.db")
+DISCOGS_TOKEN = os.getenv("DISCOGS_TOKEN", "").strip()  # optional but recommended
+DISCOGS_API = "https://api.discogs.com"
+USER_AGENT = "VinylShelf/1.0 (+https://example.local)"  # set something stable
+
+# --------------------------------------------------------------------
+# FastAPI
+# --------------------------------------------------------------------
+app = FastAPI(title="VinylShelf API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # lock down in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --------------------------------------------------------------------
+# DB helpers / schema
+# --------------------------------------------------------------------
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DATABASE_URL)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def ensure_schema() -> None:
+    conn = db()
+    cur = conn.cursor()
+
+    # records
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS records (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          artist TEXT NOT NULL DEFAULT '',
+          title  TEXT NOT NULL DEFAULT '',
+          year INTEGER,
+          label TEXT,
+          catalog_number TEXT,
+          barcode TEXT,
+          -- cover fields
+          cover_local TEXT,
+          cover_url   TEXT,
+          cover_url_auto TEXT,
+          discogs_thumb TEXT,
+          -- notes
+          album_notes TEXT,
+          personal_notes TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        """
+    )
+
+    # tracks
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tracks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          record_id INTEGER NOT NULL,
+          side TEXT NOT NULL,
+          position TEXT,
+          title TEXT NOT NULL,
+          duration TEXT,
+          FOREIGN KEY(record_id) REFERENCES records(id) ON DELETE CASCADE
+        );
+        """
+    )
+
+    # Basic "migrations" (add columns if missing)
+    cols = {r["name"] for r in cur.execute("PRAGMA table_info(records)").fetchall()}
+
+    def add_col(name: str, ddl: str):
+        if name not in cols:
+            cur.execute(f"ALTER TABLE records ADD COLUMN {name} {ddl};")
+
+    add_col("album_notes", "TEXT")
+    add_col("personal_notes", "TEXT")
+    add_col("cover_local", "TEXT")
+    add_col("cover_url", "TEXT")
+    add_col("cover_url_auto", "TEXT")
+    add_col("discogs_thumb", "TEXT")
+
+    conn.commit()
+    conn.close()
+
+
+ensure_schema()
+
+# --------------------------------------------------------------------
+# Pydantic models
+# --------------------------------------------------------------------
+class RecordIn(BaseModel):
+    artist: str = ""
+    title: str = ""
+    year: Optional[int] = None
+    label: Optional[str] = None
+    catalog_number: Optional[str] = None
+    barcode: Optional[str] = None
+    cover_local: Optional[str] = None
+    cover_url: Optional[str] = None
+    album_notes: Optional[str] = None
+    personal_notes: Optional[str] = None
+
+
+class RecordOut(BaseModel):
+    id: int
+    artist: str
+    title: str
+    year: Optional[int]
+    label: Optional[str]
+    catalog_number: Optional[str]
+    barcode: Optional[str]
+    cover_local: Optional[str]
+    cover_url: Optional[str]
+    cover_url_auto: Optional[str]
+    discogs_thumb: Optional[str]
+    album_notes: Optional[str]
+    personal_notes: Optional[str]
+
+
+class NotesIn(BaseModel):
+    album_notes: Optional[str] = None
+    personal_notes: Optional[str] = None
+
+
+class BulkDeleteIn(BaseModel):
+    ids: List[int] = Field(default_factory=list)
+
+
+# --------------------------------------------------------------------
+# Discogs utilities
+# --------------------------------------------------------------------
+def discogs_headers() -> Dict[str, str]:
+    h = {"User-Agent": USER_AGENT}
+    if DISCOGS_TOKEN:
+        h["Authorization"] = f"Discogs token={DISCOGS_TOKEN}"
+    return h
+
+
+def discogs_search(params: Dict[str, Any]) -> Dict[str, Any]:
+    url = f"{DISCOGS_API}/database/search"
+    r = requests.get(url, params=params, headers=discogs_headers(), timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Discogs search failed ({r.status_code})")
+    return r.json()
+
+
+def discogs_release_details(release_id: int) -> Dict[str, Any]:
+    url = f"{DISCOGS_API}/releases/{release_id}"
+    r = requests.get(url, headers=discogs_headers(), timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Discogs release lookup failed ({r.status_code})")
+    return r.json()
+
+
+def _looks_like_lp_vinyl(result: Dict[str, Any]) -> bool:
+    """
+    Accept only results that clearly include BOTH 'Vinyl' and 'LP' in format information.
+    Result may contain 'format' (list of strings) and/or 'format_quantity'.
+    """
+    formats = set()
+    for f in result.get("format", []) or []:
+        if isinstance(f, str):
+            formats.add(f.lower())
+
+    # Some results put format descriptors in "format" and additional in "format_description".
+    for fd in result.get("format_description", []) or []:
+        if isinstance(fd, str):
+            formats.add(fd.lower())
+
+    return ("vinyl" in formats) and ("lp" in formats)
+
+
+def _score_candidate(
+    result: Dict[str, Any], artist: str, title: str, year: Optional[int], label: Optional[str]
+) -> Tuple[int, int]:
+    """
+    Simple heuristic scoring:
+      +3 if type == 'release'
+      +3 if Vinyl+LP accepted
+      +2 if exact artist substring match
+      +2 if exact title substring match
+      +1 if year matches
+      +1 if label substring match
+    Returns (score, year_bias) where higher score is better, and year_bias favors closer years.
+    """
+    score = 0
+
+    if result.get("type") == "release":
+        score += 3
+
+    if _looks_like_lp_vinyl(result):
+        score += 3
+    else:
+        # Hard reject anything not Vinyl LP
+        return (-10_000, 0)
+
+    ra = (result.get("title") or "").lower()
+    # Discogs "title" often includes "Artist – Title"
+    if artist and artist.lower() in ra:
+        score += 2
+    if title and title.lower() in ra:
+        score += 2
+
+    y = result.get("year")
+    year_bias = 0
+    if isinstance(y, int) and year:
+        if y == year:
+            score += 1
+        year_bias = -abs(y - year)
+
+    if label:
+        # "label" may be a list
+        labels = result.get("label") or []
+        labels_l = " ".join([str(x).lower() for x in labels])
+        if label.lower() in labels_l:
+            score += 1
+
+    return (score, year_bias)
+
+
+def pick_best_discogs_release(
+    artist: str,
+    title: str,
+    year: Optional[int],
+    label: Optional[str],
+    barcode: Optional[str],
+    catno: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Query Discogs and pick the best Vinyl LP release (strict).
+    """
+    # Build a conservative search first
+    q = f"{artist} {title}".strip()
+    params = {
+        "q": q,
+        "type": "release",
+        "per_page": 50,
+        "page": 1,
+    }
+    if barcode:
+        params["barcode"] = barcode
+    if catno:
+        params["catno"] = catno
+
+    data = discogs_search(params)
+    results = data.get("results", []) or []
+
+    # If nothing and we had constraints, retry simple q
+    if not results and (barcode or catno):
+        data = discogs_search({"q": q, "type": "release", "per_page": 50, "page": 1})
+        results = data.get("results", []) or []
+
+    if not results:
+        return None
+
+    # Strict filter to Vinyl + LP
+    candidates = [r for r in results if _looks_like_lp_vinyl(r)]
+    if not candidates:
+        return None
+
+    # Score & pick
+    best = None
+    best_tuple = (-10_000, -999999)
+    for r in candidates:
+        s = _score_candidate(r, artist, title, year, label)
+        if s > best_tuple:
+            best_tuple = s
+            best = r
+
+    return best
+
+
+# --------------------------------------------------------------------
+# Records CRUD
+# --------------------------------------------------------------------
+@app.get("/api/records", response_model=List[RecordOut])
+def list_records():
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records
+        ORDER BY id DESC
+        """
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/records/{rid}", response_model=RecordOut)
+def get_record(rid: int):
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records WHERE id = ?
+        """,
+        (rid,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Record not found")
+    return dict(row)
+
+
+@app.post("/api/records", response_model=RecordOut)
+def create_record(payload: RecordIn):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO records (artist, title, year, label, catalog_number, barcode,
+                             cover_local, cover_url, album_notes, personal_notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.artist,
+            payload.title,
+            payload.year,
+            payload.label,
+            payload.catalog_number,
+            payload.barcode,
+            payload.cover_local,
+            payload.cover_url,
+            payload.album_notes,
+            payload.personal_notes,
+        ),
+    )
+    rid = cur.lastrowid
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records WHERE id = ?
+        """,
+        (rid,),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.put("/api/records/{rid}", response_model=RecordOut)
+def update_record(rid: int, payload: RecordIn):
+    conn = db()
+    cur = conn.cursor()
+    if not cur.execute("SELECT id FROM records WHERE id = ?", (rid,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    cur.execute(
+        """
+        UPDATE records SET
+            artist=?, title=?, year=?, label=?, catalog_number=?, barcode=?,
+            cover_local=?, cover_url=?, album_notes=?, personal_notes=?,
+            updated_at=CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (
+            payload.artist,
+            payload.title,
+            payload.year,
+            payload.label,
+            payload.catalog_number,
+            payload.barcode,
+            payload.cover_local,
+            payload.cover_url,
+            payload.album_notes,
+            payload.personal_notes,
+            rid,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records WHERE id = ?
+        """,
+        (rid,),
+    ).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.delete("/api/records/{rid}")
+def delete_record(rid: int):
+    conn = db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
+    cur.execute("DELETE FROM records WHERE id = ?", (rid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@app.post("/api/records/bulk-delete")
+def bulk_delete(payload: BulkDeleteIn):
+    if not payload.ids:
+        return {"deleted": 0}
+    conn = db()
+    cur = conn.cursor()
+    qmarks = ",".join("?" for _ in payload.ids)
+    cur.execute(f"DELETE FROM tracks WHERE record_id IN ({qmarks})", payload.ids)
+    cur.execute(f"DELETE FROM records WHERE id IN ({qmarks})", payload.ids)
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return {"deleted": deleted}
+
+
+# --------------------------------------------------------------------
+# Notes
+# --------------------------------------------------------------------
+@app.post("/api/records/{rid}/notes")
+def save_notes(rid: int, payload: NotesIn):
+    conn = db()
+    cur = conn.cursor()
+    if not cur.execute("SELECT id FROM records WHERE id = ?", (rid,)).fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    cur.execute(
+        """
+        UPDATE records SET
+            album_notes = ?, personal_notes = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (payload.album_notes, payload.personal_notes, rid),
+    )
+    conn.commit()
+    row = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records WHERE id = ?
+        """,
+        (rid,),
+    ).fetchone()
+    conn.close()
+    return {"ok": True, "record": dict(row)}
+
+
+# --------------------------------------------------------------------
+# Cover fetching (Discogs) — Vinyl LP only
+# --------------------------------------------------------------------
+@app.post("/api/records/{rid}/cover/fetch")
+def fetch_cover(rid: int):
+    conn = db()
+    row = conn.execute(
+        "SELECT id, artist, title, year, label, catalog_number, barcode FROM records WHERE id = ?",
+        (rid,),
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    artist = row["artist"] or ""
+    title = row["title"] or ""
+    year = row["year"]
+    label = row["label"]
+    catno = row["catalog_number"]
+    barcode = row["barcode"]
+
+    best = pick_best_discogs_release(artist, title, year, label, barcode, catno)
+    if not best:
+        conn.close()
+        raise HTTPException(status_code=404, detail="No suitable Vinyl LP release found on Discogs")
+
+    # Log the chosen release
+    print(
+        f"[Discogs] Using release ID {best.get('id')} - {best.get('title')} "
+        f"({best.get('resource_url')})"
+    )
+
+    thumb = best.get("thumb")
+    cover_url_auto = None
+
+    rel_id = best.get("id")
+    if rel_id:
+        try:
+            detail = discogs_release_details(int(rel_id))
+            images = detail.get("images") or []
+            primary = next((im for im in images if im.get("type") == "primary"), None)
+            if primary and primary.get("uri"):
+                cover_url_auto = primary["uri"]
+            elif images and images[0].get("uri"):
+                cover_url_auto = images[0]["uri"]
+        except Exception:
+            pass
+
+    conn.execute(
+        """
+        UPDATE records
+        SET discogs_thumb = ?, cover_url_auto = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+        """,
+        (thumb, cover_url_auto, rid),
+    )
+    conn.commit()
+
+    out = conn.execute(
+        """
+        SELECT id, artist, title, year, label, catalog_number, barcode,
+               cover_local, cover_url, cover_url_auto, discogs_thumb,
+               album_notes, personal_notes
+        FROM records WHERE id = ?
+        """,
+        (rid,),
+    ).fetchone()
+    conn.close()
+
+    out_dict = dict(out)
+    out_dict["discogs_release_id"] = best.get("id")
+    out_dict["discogs_release_title"] = best.get("title")
+    out_dict["discogs_resource_url"] = best.get("resource_url")
+    return out_dict
+
+
+# --------------------------------------------------------------------
+# Tracks: preview, save, get saved
+# --------------------------------------------------------------------
+@app.get("/api/records/{rid}/tracks/preview")
+def preview_tracks(rid: int):
+    conn = db()
+    row = conn.execute(
+        "SELECT id, artist, title, year, label, catalog_number, barcode FROM records WHERE id = ?",
+        (rid,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Record not found")
+
+    artist = row["artist"] or ""
+    title = row["title"] or ""
+    year = row["year"]
+    label = row["label"]
+    catno = row["catalog_number"]
+    barcode = row["barcode"]
+
+    best = pick_best_discogs_release(artist, title, year, label, barcode, catno)
+    if not best:
+        raise HTTPException(status_code=404, detail="No suitable Vinyl LP release found on Discogs")
+
+    rel_id = best.get("id")
+    if not rel_id:
+        raise HTTPException(status_code=404, detail="No release id for best match")
+
+    print(
+        f"[Discogs] Previewing tracks from release ID {rel_id} - {best.get('title')} "
+        f"({best.get('resource_url')})"
+    )
+
+    detail = discogs_release_details(int(rel_id))
+    tracklist = detail.get("tracklist") or []
+
+    sides: Dict[str, List[Dict[str, str]]] = {}
+    for t in tracklist:
+        pos = (t.get("position") or "").strip()
+        title_t = (t.get("title") or "").strip()
+        duration = (t.get("duration") or "").strip()
+
+        side = "A"
+        if pos and pos[0].isalpha():
+            side = pos[0].upper()
+
+        sides.setdefault(side, []).append(
+            {"position": pos, "title": title_t, "duration": duration}
+        )
+
+    return {
+        "discogs_release_id": rel_id,
+        "discogs_release_title": best.get("title"),
+        "discogs_resource_url": best.get("resource_url"),
+        "sides": sides,
+    }
+
+
+@app.post("/api/records/{rid}/tracks/save")
+def save_tracks(rid: int):
+    # Use preview logic, then persist
+    preview = preview_tracks(rid)  # raises if not found
+    sides: Dict[str, List[Dict[str, str]]] = preview.get("sides", {})
+
+    conn = db()
+    cur = conn.cursor()
+    # Clear existing tracks for idempotency
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
+    # Insert
+    for side, lst in sides.items():
+        for t in lst:
+            cur.execute(
+                """
+                INSERT INTO tracks (record_id, side, position, title, duration)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (rid, side, t.get("position"), t.get("title"), t.get("duration")),
+            )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "saved_tracks": sides, "discogs_release_id": preview.get("discogs_release_id")}
+
+
+@app.get("/api/records/{rid}/tracks/saved")
+def get_saved_tracks(rid: int):
+    conn = db()
+    rows = conn.execute(
+        "SELECT side, position, title, duration FROM tracks WHERE record_id = ? ORDER BY side, position",
+        (rid,),
+    ).fetchall()
+    conn.close()
+    sides: Dict[str, List[Dict[str, str]]] = {}
+    for r in rows:
+        s = r["side"] or "A"
+        sides.setdefault(s, []).append(
+            {"position": r["position"], "title": r["title"], "duration": r["duration"]}
+        )
+    return {"sides": sides}

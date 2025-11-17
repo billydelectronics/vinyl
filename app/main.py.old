@@ -1,0 +1,545 @@
+# main.py
+import os
+import io
+import csv
+import json
+import shutil
+import sqlite3
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from fastapi import FastAPI, Body, HTTPException, UploadFile, File, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
+
+# -----------------------------------------------------------------------------
+# Config & DB helpers
+# -----------------------------------------------------------------------------
+
+DB_PATH = os.environ.get("DB_PATH") or os.environ.get("DATABASE_URL")
+# Allow both styles: "sqlite:////data/records.db" (docker-compose) or plain path
+if DB_PATH and DB_PATH.startswith("sqlite:"):
+    DB_PATH = DB_PATH.replace("sqlite:///", "", 1)
+if not DB_PATH:
+    DB_PATH = "data/records.db"
+
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+
+def cx():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    # enforce FK (safe even if not used)
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
+
+def row_to_dict(r: sqlite3.Row) -> Dict[str, Any]:
+    return {k: r[k] for k in r.keys()}
+
+def ensure_schema():
+    with cx() as con:
+        # base tables
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artist TEXT,
+            title TEXT,
+            year INTEGER,
+            label TEXT,
+            format TEXT,
+            catalog_number TEXT,
+            barcode TEXT,
+            cover_url TEXT,
+            cover_local TEXT,
+            discogs_id TEXT,
+            cover_url_auto TEXT,
+            discogs_master_id TEXT,
+            discogs_thumb TEXT
+        )
+        """)
+
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            side TEXT,
+            position TEXT,
+            title TEXT,
+            duration TEXT,
+            discogs_release_id INTEGER,
+            FOREIGN KEY(record_id) REFERENCES records(id)
+        )
+        """)
+
+        # --- migrations (idempotent) ---
+        cols = {r[1] for r in con.execute("PRAGMA table_info(records)")}
+        if "album_notes" not in cols:
+            con.execute("ALTER TABLE records ADD COLUMN album_notes TEXT")
+        if "personal_notes" not in cols:
+            con.execute("ALTER TABLE records ADD COLUMN personal_notes TEXT")
+
+        tcols = {r[1] for r in con.execute("PRAGMA table_info(tracks)")}
+        if "discogs_release_id" not in tcols:
+            con.execute("ALTER TABLE tracks ADD COLUMN discogs_release_id INTEGER")
+
+        # some helpful indexes
+        con.execute("CREATE INDEX IF NOT EXISTS idx_tracks_record ON tracks(record_id)")
+        con.commit()
+
+ensure_schema()
+
+# -----------------------------------------------------------------------------
+# App + CORS
+# -----------------------------------------------------------------------------
+
+app = FastAPI(title="Vinyl API (SQLite + Discogs)")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    allow_credentials=True,
+)
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
+def load_record(rid: int) -> Dict[str, Any]:
+    with cx() as con:
+        row = con.execute("SELECT * FROM records WHERE id=?", (rid,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Record not found")
+        return row_to_dict(row)
+
+def update_record_fields(rid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not payload:
+        return load_record(rid)
+
+    allowed = {
+        "artist", "title", "year", "label", "format", "catalog_number", "barcode",
+        "cover_url", "cover_local", "discogs_id", "cover_url_auto",
+        "discogs_master_id", "discogs_thumb",
+        "album_notes", "personal_notes",
+    }
+    keys = [k for k in payload.keys() if k in allowed]
+    if not keys:
+        return load_record(rid)
+
+    sets = ", ".join(f"{k}=?" for k in keys)
+    vals = [payload[k] for k in keys]
+    with cx() as con:
+        con.execute(f"UPDATE records SET {sets} WHERE id=?", (*vals, rid))
+        con.commit()
+    return load_record(rid)
+
+def group_tracks_sides(rows: List[sqlite3.Row]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        side = (r["side"] or "").strip() or "?"
+        grouped.setdefault(side, []).append({
+            "position": r["position"],
+            "title": r["title"],
+            "duration": r["duration"] or "",
+        })
+    # stable sort by position-ish (A1,A2,... B1,...) if possible
+    for s in grouped.values():
+        s.sort(key=lambda x: x.get("position") or "")
+    return grouped
+
+def discogs_headers() -> Dict[str, str]:
+    # Supports either TOKEN or key/secret (token preferred)
+    token = os.environ.get("DISCOGS_TOKEN")
+    headers = {"User-Agent": "vinyl-app/0.1"}
+    if token:
+        headers["Authorization"] = f"Discogs token={token}"
+    return headers
+
+def choose_release_from_search(search_json: Dict[str, Any]) -> Optional[int]:
+    """
+    Pick a plausible release id from Discogs search results, prefer Vinyl.
+    """
+    results = search_json.get("results") or []
+    if not results:
+        return None
+    # prefer items with 'format' including 'Vinyl'
+    vinyl = [r for r in results if any(isinstance(f, str) and "vinyl" in f.lower() for f in (r.get("format") or []))]
+    pick = (vinyl or results)[0]
+    return pick.get("id")
+
+def fetch_discogs_tracklist_by_release_id(release_id: int) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    """
+    Returns (release_id, flat_tracks).
+    Each track: {side?, position, title, duration?}
+    """
+    if not release_id:
+        return None, []
+    url = f"https://api.discogs.com/releases/{release_id}"
+    r = requests.get(url, headers=discogs_headers(), timeout=20)
+    if r.status_code != 200:
+        return None, []
+    data = r.json()
+    flat = []
+    for t in (data.get("tracklist") or []):
+        flat.append({
+            "side": (t.get("position") or "").split()[0].split("-")[0].split(".")[0][:1] if t.get("position") else None,
+            "position": t.get("position") or "",
+            "title": t.get("title") or "",
+            "duration": t.get("duration") or "",
+        })
+    return release_id, flat
+
+def fetch_discogs_cover_by_release_id(release_id: int) -> Optional[str]:
+    url = f"https://api.discogs.com/releases/{release_id}"
+    r = requests.get(url, headers=discogs_headers(), timeout=20)
+    if r.status_code != 200:
+        return None
+    data = r.json()
+    images = data.get("images") or []
+    if images:
+        # prefer primary or first
+        primary = [i for i in images if i.get("type") == "primary"]
+        img = (primary or images)[0]
+        return img.get("uri") or img.get("resource_url")
+    return None
+
+def cover_local_path(rid: int) -> str:
+    # Store in /app/static/covers/{rid}.jpg and serve via Caddy/Svelte static.
+    # Adjust to your static root. We'll just keep path on disk and store a relative URL.
+    root = "static/covers"
+    os.makedirs(root, exist_ok=True)
+    return os.path.join(root, f"{rid}.jpg")
+
+def download_to(path: str, url: str) -> bool:
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            if r.status_code != 200:
+                return False
+            with open(path, "wb") as f:
+                shutil.copyfileobj(r.raw, f)
+        return True
+    except Exception:
+        return False
+
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+
+@app.get("/api/health", tags=["api"], summary="Health")
+def health():
+    return {"ok": True}
+
+@app.get("/health", summary="Health Legacy")
+def health_legacy():
+    return {"ok": True}
+
+# -----------------------------------------------------------------------------
+# Records CRUD
+# -----------------------------------------------------------------------------
+
+@app.get("/api/records", tags=["api"], summary="List Records")
+def list_records():
+    with cx() as con:
+        rows = con.execute("SELECT * FROM records ORDER BY id").fetchall()
+        return [row_to_dict(r) for r in rows]
+
+@app.post("/api/records", tags=["api"], summary="Create Record")
+def create_record(payload: Dict[str, Any] = Body(..., embed=False)):
+    rec = {
+        "artist": payload.get("artist") or "",
+        "title": payload.get("title") or "",
+        "year": payload.get("year"),
+        "label": payload.get("label"),
+        "format": payload.get("format"),
+        "catalog_number": payload.get("catalog_number"),
+        "barcode": payload.get("barcode"),
+        "cover_url": payload.get("cover_url"),
+        "cover_local": payload.get("cover_local"),
+        "discogs_id": payload.get("discogs_id"),
+        "cover_url_auto": payload.get("cover_url_auto"),
+        "discogs_master_id": payload.get("discogs_master_id"),
+        "discogs_thumb": payload.get("discogs_thumb"),
+        "album_notes": payload.get("album_notes"),
+        "personal_notes": payload.get("personal_notes"),
+    }
+    with cx() as con:
+        cur = con.execute("""
+            INSERT INTO records
+              (artist,title,year,label,format,catalog_number,barcode,
+               cover_url,cover_local,discogs_id,cover_url_auto,discogs_master_id,discogs_thumb,
+               album_notes,personal_notes)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            rec["artist"], rec["title"], rec["year"], rec["label"], rec["format"],
+            rec["catalog_number"], rec["barcode"], rec["cover_url"], rec["cover_local"],
+            rec["discogs_id"], rec["cover_url_auto"], rec["discogs_master_id"], rec["discogs_thumb"],
+            rec["album_notes"], rec["personal_notes"],
+        ))
+        rid = cur.lastrowid
+        con.commit()
+    return load_record(rid)
+
+@app.get("/api/records/{rid}", tags=["api"], summary="Get Record")
+def get_record(rid: int):
+    return load_record(rid)
+
+@app.put("/api/records/{rid}", tags=["api"], summary="Update Record")
+def update_record(rid: int, payload: Dict[str, Any] = Body(..., embed=False)):
+    return update_record_fields(rid, payload)
+
+@app.delete("/api/records/{rid}", tags=["api"], summary="Delete Record")
+def delete_record(rid: int):
+    _ = load_record(rid)
+    with cx() as con:
+        con.execute("DELETE FROM tracks WHERE record_id=?", (rid,))
+        con.execute("DELETE FROM records WHERE id=?", (rid,))
+        con.commit()
+    # also delete local cover if present
+    path = cover_local_path(rid)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+    return {"ok": True, "deleted": rid}
+
+# -----------------------------------------------------------------------------
+# CSV Import/Export
+# -----------------------------------------------------------------------------
+
+@app.post("/api/import.csv", tags=["api"], summary="Import Csv")
+def import_csv(replace: int = Query(0), file: UploadFile = File(...)):
+    content = file.file.read().decode("utf-8", errors="replace")
+    reader = csv.DictReader(io.StringIO(content))
+    rows = list(reader)
+
+    with cx() as con:
+        if replace:
+            con.execute("DELETE FROM tracks")
+            con.execute("DELETE FROM records")
+        for r in rows:
+            con.execute("""
+                INSERT INTO records
+                (artist,title,year,label,format,catalog_number,barcode,
+                 cover_url,cover_local,discogs_id,cover_url_auto,discogs_master_id,discogs_thumb,
+                 album_notes,personal_notes)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                r.get("artist"), r.get("title"),
+                int(r["year"]) if (r.get("year") and r["year"].isdigit()) else None,
+                r.get("label"), r.get("format"), r.get("catalog_number"), r.get("barcode"),
+                r.get("cover_url"), r.get("cover_local"), r.get("discogs_id"),
+                r.get("cover_url_auto"), r.get("discogs_master_id"), r.get("discogs_thumb"),
+                r.get("album_notes"), r.get("personal_notes"),
+            ))
+        con.commit()
+    return {"ok": True, "imported": len(rows)}
+
+@app.get("/api/export.csv", tags=["api"], summary="Export Csv", response_class=PlainTextResponse)
+def export_csv():
+    with cx() as con:
+        rows = con.execute("SELECT * FROM records ORDER BY id").fetchall()
+    if not rows:
+        return ""
+
+    fieldnames = list(rows[0].keys())
+    out = io.StringIO()
+    w = csv.DictWriter(out, fieldnames=fieldnames)
+    w.writeheader()
+    for r in rows:
+        w.writerow(row_to_dict(r))
+    return out.getvalue()
+
+# -----------------------------------------------------------------------------
+# Discogs: Search passthrough
+# -----------------------------------------------------------------------------
+
+@app.get("/api/discogs/search", tags=["api"], summary="Discogs Search Route",
+         description="Simple passthrough to Discogs database search.")
+def discogs_search_route(artist: str = "", title: str = ""):
+    params = {"type": "release"}
+    if artist:
+        params["artist"] = artist
+    if title:
+        params["title"] = title
+    r = requests.get("https://api.discogs.com/database/search", headers=discogs_headers(), params=params, timeout=20)
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail="Discogs search failed")
+    return r.json()
+
+# -----------------------------------------------------------------------------
+# Cover fetch
+# -----------------------------------------------------------------------------
+
+@app.post("/api/records/{rid}/cover/fetch", tags=["api"], summary="Fetch Cover",
+          description="Pick a cover (prefer vinyl release); download locally; update record.")
+def fetch_cover(rid: int):
+    rec = load_record(rid)
+
+    # if we already have a discogs_id, try that first as a release id
+    release_id = None
+    if rec.get("discogs_id"):
+        try:
+            release_id = int(rec["discogs_id"])
+        except Exception:
+            release_id = None
+
+    # Otherwise search by artist/title
+    if not release_id:
+        params = {"type": "release"}
+        if rec.get("artist"):
+            params["artist"] = rec["artist"]
+        if rec.get("title"):
+            params["title"] = rec["title"]
+        sr = requests.get("https://api.discogs.com/database/search", headers=discogs_headers(), params=params, timeout=20)
+        if sr.status_code == 200:
+            release_id = choose_release_from_search(sr.json())
+
+    if not release_id:
+        raise HTTPException(status_code=404, detail="No Discogs release found for cover fetch")
+
+    img = fetch_discogs_cover_by_release_id(release_id)
+    if not img:
+        raise HTTPException(status_code=404, detail="No cover image found on Discogs")
+
+    # try download locally
+    local_path = cover_local_path(rid)
+    if download_to(local_path, img):
+        cover_local_url = f"/{local_path}"
+    else:
+        cover_local_url = None
+
+    payload = {
+        "cover_url_auto": img,
+        "cover_local": cover_local_url,
+        "discogs_id": str(release_id),
+    }
+    return update_record_fields(rid, payload)
+
+# -----------------------------------------------------------------------------
+# Tracks: preview, save, saved
+# -----------------------------------------------------------------------------
+
+@app.get("/api/records/{rid}/tracks", tags=["api"], summary="Record Tracks",
+         description="Returns tracklist grouped by sides. Uses saved tracks if present; otherwise searches Discogs.")
+def record_tracks(rid: int, debug: int = 0):
+    rec = load_record(rid)
+
+    # If already saved in DB, return that
+    with cx() as con:
+        saved = con.execute(
+            "SELECT * FROM tracks WHERE record_id=? ORDER BY side, position", (rid,)
+        ).fetchall()
+    if saved:
+        return {"release_id": saved[0]["discogs_release_id"], "sides": group_tracks_sides(saved)}
+
+    # Else: search Discogs by artist/title, prefer vinyl
+    params = {"type": "release"}
+    if rec.get("artist"):
+        params["artist"] = rec["artist"]
+    if rec.get("title"):
+        params["title"] = rec["title"]
+
+    search = requests.get("https://api.discogs.com/database/search", headers=discogs_headers(), params=params, timeout=20)
+    tried = []
+    release_id = None
+    flat_tracks: List[Dict[str, Any]] = []
+
+    if search.status_code == 200:
+        sj = search.json()
+        release_id = choose_release_from_search(sj)
+        if release_id:
+            tried.append(release_id)
+            release_id, flat_tracks = fetch_discogs_tracklist_by_release_id(release_id)
+
+    if not flat_tracks:
+        # fallback: return empty structure
+        resp = {"release_id": release_id, "sides": {"A": [], "B": []}}
+        if debug:
+            resp["debug"] = {"tried": tried}
+        return resp
+
+    # group into sides
+    sides: Dict[str, List[Dict[str, Any]]] = {}
+    for t in flat_tracks:
+        side = (t.get("side") or "").strip() or (t.get("position")[:1] if t.get("position") else "?")
+        sides.setdefault(side, []).append({
+            "position": t.get("position") or "",
+            "title": t.get("title") or "",
+            "duration": t.get("duration") or "",
+        })
+    for s in sides.values():
+        s.sort(key=lambda x: x.get("position") or "")
+    resp = {"release_id": release_id, "sides": sides}
+    if debug:
+        resp["debug"] = {"tried": tried}
+    return resp
+
+@app.post("/api/records/{rid}/tracks/save", summary="Tracks Save",
+          description="""
+Persist a previewed track listing into DB.
+
+Accepts either:
+{
+  "release_id": <int|null>,
+  "sides": { "A":[{position,title,duration?},...], "B":[...], ... }
+}
+or
+{
+  "release_id": <int|null>,
+  "tracks": [ {side, position, title, duration?}, ... ]
+}
+""")
+def tracks_save(rid: int, payload: Dict[str, Any] = Body(..., embed=False)):
+    _ = load_record(rid)
+
+    release_id = payload.get("release_id")
+    incoming_tracks: List[Dict[str, Any]] = []
+
+    if "tracks" in payload and isinstance(payload["tracks"], list):
+        # flat list provided
+        for t in payload["tracks"]:
+            incoming_tracks.append({
+                "side": t.get("side"),
+                "position": t.get("position"),
+                "title": t.get("title"),
+                "duration": t.get("duration"),
+            })
+    else:
+        # sides dict provided
+        sides = payload.get("sides") or {}
+        for side, items in sides.items():
+            for t in (items or []):
+                incoming_tracks.append({
+                    "side": side,
+                    "position": t.get("position"),
+                    "title": t.get("title"),
+                    "duration": t.get("duration"),
+                })
+
+    with cx() as con:
+        con.execute("DELETE FROM tracks WHERE record_id=?", (rid,))
+        if incoming_tracks:
+            con.executemany("""
+                INSERT INTO tracks (record_id, side, position, title, duration, discogs_release_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, [
+                (rid, t.get("side"), t.get("position"), t.get("title"), t.get("duration"), release_id)
+                for t in incoming_tracks
+            ])
+        con.commit()
+
+    return {"ok": True, "saved": len(incoming_tracks)}
+
+@app.get("/api/records/{rid}/tracks/saved", tags=["api"], summary="Tracks Saved")
+def tracks_saved(rid: int):
+    _ = load_record(rid)
+    with cx() as con:
+        rows = con.execute(
+            "SELECT * FROM tracks WHERE record_id=? ORDER BY side, position", (rid,)
+        ).fetchall()
+    return {"sides": group_tracks_sides(rows)}
+
+# -----------------------------------------------------------------------------
+# Done
+# -----------------------------------------------------------------------------

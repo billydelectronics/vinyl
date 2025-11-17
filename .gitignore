@@ -1,0 +1,41 @@
+# --- Node / Svelte ---
+node_modules/
+dist/
+.svelte-kit/
+build/
+.vite/
+*.log
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+.venv/
+venv/
+.env
+.env.*
+
+# --- Docker ---
+docker-data/
+docker-volume/
+*.pid
+
+# --- Mac / OS Junk ---
+.DS_Store
+*.DS_Store
+Icon?
+._*
+
+# --- Editor / IDE ---
+.vscode/
+*.code-workspace
+
+# --- Testing ---
+pytest_cache/
+coverage/
+*.coverage
+
+# --- SvelteKit (extra safety) ---
+.server/

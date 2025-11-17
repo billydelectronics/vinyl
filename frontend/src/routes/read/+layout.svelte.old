@@ -1,0 +1,143 @@
+<script lang="ts">
+  import { onMount, onDestroy } from 'svelte';
+
+  let undo: Array<() => void> = [];
+  let mo: MutationObserver | null = null;
+
+  /** Hide non-read actions from the top nav 
+  function hideSelector(sel: string) {
+    const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
+    for (const el of els) {
+      const prev = el.style.display;
+      el.style.display = 'none';
+      undo.push(() => { el.style.display = prev; });
+    }
+  } */
+
+  /** Ensure a consistent Read-Only link beside Home in the top nav */
+  function ensureReadOnlyTopNav() {
+    const home = document.querySelector<HTMLAnchorElement>('a[href="/"]');
+    const parent = home?.parentElement ?? document.querySelector('nav');
+    if (!parent) return;
+    if (document.querySelector('a[href="/read"]')) return;
+
+    const a = document.createElement('a');
+    a.href = '/read';
+    a.textContent = 'Read-Only';
+    a.setAttribute(
+      'class',
+      home?.getAttribute('class') ??
+        'px-3 py-1.5 text-sm rounded-md border border-zinc-700 hover:bg-zinc-800'
+    );
+    (home?.parentElement ?? parent).insertBefore(a, home?.nextSibling ?? null);
+    undo.push(() => a.remove());
+  }
+
+  /** Decide if an element is the back header or control */
+  function looksLikeBack(el: HTMLElement): boolean {
+    if (!el) return false;
+
+    // exact header shape from compiled HTML
+    if (el.matches('header.flex.items-center.justify-between')) return true;
+
+    if (el.matches('a,button')) {
+      const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+      if (/^←/u.test(t)) return true;
+      if (/Back\s*to\s*Library/i.test(t)) return true;
+      if (/Read[- ]Only/i.test(t)) return true;
+      if (el.matches('a[href="/read"]')) return true;
+    }
+
+    // wrapper rows that often contain the back control
+    if (el.classList?.contains('mb-6') && el.querySelector('a,button')) return true;
+
+    return false;
+  }
+
+  function removeBack(root: ParentNode = document) {
+    const nodes = Array.from(
+      root.querySelectorAll<HTMLElement>(
+        [
+          // compiled structure
+          '.p-6.space-y-6 > header.flex.items-center.justify-between',
+          // any anchor that looks like back-to-read
+          'a[href="/read"]',
+          // common wrappers/controls
+          'header.flex.items-center.justify-between',
+          '.mb-6',
+          'a',
+          'button'
+        ].join(',')
+      )
+    );
+
+    for (const el of nodes) {
+      if (!el.isConnected) continue;
+      if (looksLikeBack(el)) {
+        const headerRow = el.closest<HTMLElement>('header.flex.items-center.justify-between');
+        if (headerRow) headerRow.remove();
+        else el.remove();
+      }
+    }
+  }
+
+  onMount(() => {
+    hideSelector('a[href="/scan"], a[href="/import"], a[href="/export"]');
+    ensureReadOnlyTopNav();
+
+    // Initial sweep (in case hydration inserts)
+    removeBack(document);
+
+    // Observe for any reinsertions
+    mo = new MutationObserver((muts) => {
+      for (const m of muts) {
+        m.addedNodes.forEach((n) => {
+          if (n instanceof HTMLElement) {
+            if (looksLikeBack(n)) {
+              const headerRow = n.closest?.('header.flex.items-center.justify-between');
+              if (headerRow) headerRow.remove();
+              else n.remove();
+            } else {
+              removeBack(n);
+            }
+          }
+        });
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+
+    // a couple timed sweeps as insurance
+    [100, 300, 800, 1500].forEach((ms) => setTimeout(() => removeBack(document), ms));
+  });
+
+  onDestroy(() => {
+    mo?.disconnect();
+    for (const fn of undo.reverse()) try { fn(); } catch {}
+    undo = [];
+  });
+</script>
+
+<!-- GLOBAL CSS so SSR markup is hidden before paint -->
+<style>
+  /* Exact SSR structure from compiled file */
+  :global(.p-6.space-y-6 > header.flex.items-center.justify-between) {
+    display: none !important;
+  }
+  :global(.p-6.space-y-6 > header.flex.items-center.justify-between a[href="/read"]) {
+    display: none !important;
+  }
+
+  /* Extra catch-alls just in case */
+  :global(header.flex.items-center.justify-between:has(a[href="/read"])) {
+    display: none !important;
+  }
+  :global(.mb-6:has(a[href="/read"])),
+  :global(.mb-6:has(button)) {
+    display: none !important;
+  }
+  :global(a[href="/read"]) {
+    /* hide any back-to-read anchor inside the content area */
+  }
+</style>
+
+<slot />

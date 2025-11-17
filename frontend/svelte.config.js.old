@@ -1,0 +1,15 @@
+import adapter from '@sveltejs/adapter-node';
+import preprocess from 'svelte-preprocess';
+
+const config = {
+  preprocess: preprocess({
+    typescript: true,
+    postcss: true
+  }),
+  kit: {
+    adapter: adapter(),
+    csrf: { trustedOrigins: ['http://vinyl.localhost', 'http://localhost:3000'] }
+  }
+};
+
+export default config;

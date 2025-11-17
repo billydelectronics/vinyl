@@ -1,0 +1,25 @@
+:80 {
+	log {
+		output stdout
+		format console
+	}
+
+	# --- API -> FastAPI (container listens on :80) ---
+	@api path /api*
+	handle @api {
+		# Do NOT use handle_path here; it would strip the "/api" prefix.
+		reverse_proxy app:80
+	}
+
+	# --- Static covers (optional) ---
+	@covers path /covers/*
+	handle @covers {
+		root * /usr/share/caddy
+		file_server
+	}
+
+	# Everything else -> Frontend server on port 3000
+    handle {
+        reverse_proxy frontend:3000
+    }
+}

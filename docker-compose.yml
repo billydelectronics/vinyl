@@ -1,0 +1,74 @@
+services:
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    image: vinyl-app:latest
+    container_name: vinyl_app
+    restart: unless-stopped
+    environment:
+      - VINYL_DB=/app/data/records.db
+      - DISCOGS_TOKEN=${DISCOGS_TOKEN:-}
+      - USER_AGENT=VinylRecordTracker/1.0
+      - REQUEST_TIMEOUT=20
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:80/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    networks: [vinylnet]
+
+  frontend:
+    # Must actually serve the app on :3000 (see frontend/Dockerfile + package.json below)
+    build:
+      context: ./frontend
+    image: vinyl-frontend:latest
+    container_name: vinyl_frontend
+    restart: unless-stopped
+    expose:
+      - "3000"
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      # Switch to a real probe once server is confirmed up
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    networks: [vinylnet]
+
+  caddy:
+    image: caddy:2
+    container_name: vinyl_caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ >/dev/null 2>&1 || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+      start_period: 10s
+    networks: [vinylnet]
+
+networks:
+  vinylnet:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:

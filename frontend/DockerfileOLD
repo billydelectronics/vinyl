@@ -1,0 +1,44 @@
+# ---------- Build stage ----------
+FROM node:20-alpine AS build
+
+# Pin npm to match your Mac
+RUN npm i -g npm@11.6.1
+
+WORKDIR /app
+# NOTE: no NODE_ENV=production here — we need devDeps to build
+
+# Install deps (prefer lockfile if present)
+COPY package*.json ./
+RUN if [ -f package-lock.json ]; then \
+      npm ci --no-audit --no-fund; \
+    else \
+      npm install --no-audit --no-fund; \
+    fi
+
+# Ensure Svelte 4 toolchain is present (only install if missing)
+RUN npm ls @sveltejs/vite-plugin-svelte >/dev/null 2>&1 || npm i -D @sveltejs/vite-plugin-svelte@^3.1.2
+RUN npm ls svelte-preprocess          >/dev/null 2>&1 || npm i -D svelte-preprocess@^5.1.4
+RUN npm ls typescript                 >/dev/null 2>&1 || npm i -D typescript@^5.6.3 tslib@^2.6.3
+
+# Copy the rest and build
+COPY . .
+RUN npm run build
+
+# ---------- Runtime stage ----------
+FROM node:20-alpine
+
+# Pin npm here too so runtime matches build/local
+RUN npm i -g npm@11.6.1
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Copy only what's needed to run
+COPY --from=build /app/build ./build
+COPY --from=build /app/package*.json ./
+
+# Install runtime deps only (no dev)
+RUN npm install --omit=dev --no-audit --no-fund
+
+EXPOSE 3000
+CMD ["node", "build/index.js"]

@@ -1,0 +1,55 @@
+/* Global styles for Vinyl (Tailwind v3 + Skeleton v3+) */
+
+/* ------------------------------------------------------------------ */
+/*  Tailwind MUST come first                                           */
+/* ------------------------------------------------------------------ */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/*  Skeleton (Svelte 5 line)                                           */
+/* ------------------------------------------------------------------ */
+@import '@skeletonlabs/skeleton';
+@import '@skeletonlabs/skeleton-svelte';
+@import '@skeletonlabs/skeleton/themes/cerberus';
+
+/* ------------------------------------------------------------------ */
+/*  Custom global overrides                                            */
+/* ------------------------------------------------------------------ */
+
+/* Hide the SSR back header that appears at the top of read-only detail pages.
+   This matches the exact structure emitted by the compiled SSR:
+   <div class="p-6 space-y-6">
+     <header class="flex items-center justify-between">
+       <h1 class="text-xl font-semibold">Record (Read-Only)</h1>
+       <a href="/read">← Back to Library</a>
+     </header>
+     …
+   </div>
+*/
+
+/* Base kill for that header row 
+.p-6.space-y-6 > header.flex.items-center.justify-between,
+.p-6.space-y-6 > header.flex.items-center.justify-between a[href="/read"] {
+    display: none !important;
+} */
+
+/* Also hide any header that includes a link back to /read 
+header.flex.items-center.justify-between:has(a[href="/read"]) {
+    display: none !important;
+} */
+
+/* In case the wrapper adds .read-mode (from +layout.svelte) 
+.read-mode header.flex.items-center.justify-between:has(a[href="/read"]),
+.read-mode .mb-6:has(a[href="/read"]),
+.read-mode .mb-6:has(button) {
+    display: none !important;
+} */
+
+/* Prevent accidental flashes of the back header before hydration 
+@layer base {
+    .p-6.space-y-6 > header.flex.items-center.justify-between {
+        visibility: hidden;
+    }
+} */
