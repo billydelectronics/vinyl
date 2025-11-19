@@ -83,7 +83,7 @@
         <span>🎵</span><span>Vinyl</span>
       </a>
 
-      <!-- Nav: 🔎 (only on main /read), then 🏠 and 📖 -->
+      <!-- Nav: 🔎 (only on main /read), then Utility, then Read Library -->
       <nav class="flex items-center gap-4 text-xl">
         {#if inReadList}
           <button
@@ -96,13 +96,16 @@
           >🔎</button>
         {/if}
 
+        <!-- Utility (was Home) -->
         <a
-          href="/"
-          data-active={isActive('/')}
+          href="/utility"
+          data-active={isActive('/utility')}
           class="hover:opacity-80 data-[active=true]:opacity-100"
-          aria-current={isActive('/') ? 'page' : undefined}
-        >🏠</a>
+          aria-current={isActive('/utility') ? 'page' : undefined}
+          title="Utility"
+        >🛠</a>
 
+        <!-- Read Library -->
         <a
           href="/read"
           data-active={isActive('/read')}
