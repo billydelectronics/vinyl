@@ -5,11 +5,13 @@
   import ToastHost from '$lib/ToastHost.svelte';
 
   $: pathname = $page.url.pathname;
-  // Robust: matches "/read", "/read/", and "/read/…"
-  $: inRead = /^\/read(?:\/|$)/.test(pathname);
+  // True only on the main read page, not on /read/[id]
+  $: inReadList = pathname === '/read' || pathname === '/read/';
 
-  const STORE_KEY = 'readControlsVisible';
-  let controlsVisible = true;
+  // New key so old saved values don't force it open
+  const STORE_KEY = 'readControlsVisible_v2';
+  // Default: search & filters are HIDDEN on first load
+  let controlsVisible = false;
 
   function applyControlsState(state: boolean) {
     if (typeof document === 'undefined') return;
@@ -25,7 +27,11 @@
       const input = document.getElementById('searchInput') as HTMLInputElement | null;
       if (input) {
         // preventScroll avoids fighting our window.scrollTo smooth animation
-        try { input.focus({ preventScroll: true } as any); } catch { input.focus(); }
+        try {
+          input.focus({ preventScroll: true } as any);
+        } catch {
+          input.focus();
+        }
       }
     });
   }
@@ -33,11 +39,13 @@
   function toggleControls() {
     const next = !controlsVisible;
     controlsVisible = next;
-    try { localStorage.setItem(STORE_KEY, JSON.stringify(controlsVisible)); } catch {}
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify(controlsVisible));
+    } catch {}
     applyControlsState(next);
 
     // If we just made them visible while on /read, scroll to the top and focus search
-    if (inRead && next && typeof window !== 'undefined') {
+    if (inReadList && next && typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
       focusSearchInputSoon();
     }
@@ -46,13 +54,13 @@
   onMount(() => {
     try {
       const saved = localStorage.getItem(STORE_KEY);
-      controlsVisible = saved ? JSON.parse(saved) : true;
+      controlsVisible = saved ? JSON.parse(saved) : false; // default closed
     } catch {}
     applyControlsState(controlsVisible);
   });
 
-  // Re-apply when navigating within /read so new pages pick up the state
-  $: if (inRead) {
+  // Re-apply whenever we're on the main /read page AND the pathname changes
+  $: if (inReadList && pathname) {
     queueMicrotask(() => applyControlsState(controlsVisible));
   }
 
@@ -75,9 +83,9 @@
         <span>🎵</span><span>Vinyl</span>
       </a>
 
-      <!-- Nav: 🔎 (only on /read*), then 🏠 and 📖 -->
+      <!-- Nav: 🔎 (only on main /read), then 🏠 and 📖 -->
       <nav class="flex items-center gap-4 text-xl">
-        {#if inRead}
+        {#if inReadList}
           <button
             type="button"
             on:click={toggleControls}
