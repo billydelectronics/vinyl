@@ -555,6 +555,41 @@ def api_records_schema() -> Dict[str, Any]:
     ]
     return {"fields": fields}
 
+@app.get("/api/meta/import-template")
+def api_import_template() -> Response:
+    """
+    Serve the import CSV template with the expected header columns.
+    Only Artist and Title are logically required; others are optional.
+    """
+    columns = [
+        "Artist",
+        "Title",
+        "Year",
+        "Label",
+        "Format",
+        "Country",
+        "Catalog #",
+        "Barcode",
+        "Discogs ID (manual)",
+        "Manual Cover URL",
+        "Album Notes",
+        "Personal Notes",
+    ]
+
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(columns)
+    csv_text = sio.getvalue()
+
+    headers = {
+        "Content-Disposition": 'attachment; filename="utility_import_template_latest.csv"'
+    }
+    return Response(
+        content=csv_text,
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
 # Export ALL rows/columns as CSV
 @app.get("/api/export/csv")
 def api_export_csv() -> Response:

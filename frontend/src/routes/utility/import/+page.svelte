@@ -1,8 +1,8 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
 
-  // These must match your template exactly
-  const REQUIRED_HEADERS = [
+  // All template columns (for display)
+  const TEMPLATE_HEADERS = [
     'Artist',
     'Title',
     'Year',
@@ -17,6 +17,9 @@
     'Personal Notes'
   ];
 
+  // Only these are *required* for import to run
+  const REQUIRED_FOR_IMPORT = ['Artist', 'Title'];
+
   let fileInput: HTMLInputElement | null = null;
   let selectedFile: File | null = null;
 
@@ -26,15 +29,17 @@
   let successMessage = '';
   let errorMessage = '';
 
-  $: missingHeaders = REQUIRED_HEADERS.filter(
+  // Missing required fields (Artist + Title only)
+  $: missingRequiredHeaders = REQUIRED_FOR_IMPORT.filter(
     (h) => !headers.some((hdr) => hdr.toLowerCase() === h.toLowerCase())
   );
 
+  // Extra columns not in the template list (informational only)
   $: extraHeaders =
     headers.length === 0
       ? []
       : headers.filter(
-          (hdr) => !REQUIRED_HEADERS.some((req) => req.toLowerCase() === hdr.toLowerCase())
+          (hdr) => !TEMPLATE_HEADERS.some((req) => req.toLowerCase() === hdr.toLowerCase())
         );
 
   function resetMessages() {
@@ -79,8 +84,9 @@
       return;
     }
 
-    if (missingHeaders.length > 0) {
-      errorMessage = 'The CSV is missing required columns. Please fix the header row and try again.';
+    if (missingRequiredHeaders.length > 0) {
+      errorMessage =
+        'The CSV is missing required columns (Artist and Title). Please fix the header row and try again.';
       return;
     }
 
@@ -141,7 +147,7 @@
         <div class="text-sm uppercase tracking-wide text-gray-400">Utility</div>
         <div class="text-xl font-semibold text-gray-100">Import CSV</div>
       </div>
-      <!-- no Back button here anymore -->
+      <!-- Back button only shown after success (see bottom section) -->
     </div>
   </div>
 
@@ -149,16 +155,17 @@
   <div class="mx-auto max-w-3xl px-4 py-8 space-y-6">
     <section class="space-y-3">
       <p class="text-gray-300">
-        Use this page to import records in bulk from a CSV file. The CSV must use the official template
-        and include the following columns in the header row:
+        Use this page to import records in bulk from a CSV file. The CSV should use the standard
+        template. Only <span class="font-semibold">Artist</span> and <span class="font-semibold">Title</span> are required; the other
+        columns are optional.
       </p>
 
       <div class="rounded-lg border border-gray-800 bg-gray-900/80 p-4">
         <div class="text-xs uppercase tracking-wide text-gray-400 mb-2">
-          Required columns (header row)
+          Template columns (header row)
         </div>
         <ul class="grid grid-cols-1 sm:grid-cols-2 gap-1 text-sm text-gray-100">
-          {#each REQUIRED_HEADERS as col}
+          {#each TEMPLATE_HEADERS as col}
             <li class="flex items-center gap-2">
               <span
                 class="inline-flex h-4 w-4 items-center justify-center rounded-full border text-[10px]
@@ -168,7 +175,12 @@
               >
                 {headers.some((h) => h.toLowerCase() === col.toLowerCase()) ? '✓' : '•'}
               </span>
-              <span>{col}</span>
+              <span>
+                {col}
+                {#if REQUIRED_FOR_IMPORT.some((r) => r.toLowerCase() === col.toLowerCase())}
+                  <span class="text-[11px] text-amber-300 ml-1">(required)</span>
+                {/if}
+              </span>
             </li>
           {/each}
         </ul>
@@ -176,11 +188,12 @@
         <div class="mt-4 text-xs text-gray-400">
           Need a fresh template?{' '}
           <a
-            href="sandbox:/mnt/data/utility_import_template_v2.csv"
+            href="/api/meta/import-template"
             class="text-emerald-400 hover:underline"
           >
             Download CSV template
           </a>
+          
         </div>
       </div>
     </section>
@@ -224,16 +237,16 @@
             {/each}
           </div>
 
-          {#if missingHeaders.length}
+          {#if missingRequiredHeaders.length}
             <div class="mt-3 text-xs text-amber-300">
-              Missing required columns:{' '}
-              {missingHeaders.join(', ')}. Please update the CSV header row before importing.
+              Missing required columns: {missingRequiredHeaders.join(', ')}.
+              Please update the CSV header row before importing.
             </div>
           {/if}
 
           {#if extraHeaders.length}
             <div class="mt-2 text-xs text-gray-400">
-              Extra columns (will be ignored by the importer if not recognized):{' '}
+              Extra columns (may be ignored by the importer if not recognized):{' '}
               {extraHeaders.join(', ')}.
             </div>
           {/if}
@@ -246,7 +259,7 @@
         type="button"
         class="px-4 py-2 rounded-lg border border-emerald-600 bg-emerald-600 hover:bg-emerald-500 text-sm font-medium text-white disabled:opacity-50 disabled:cursor-not-allowed"
         on:click={runImport}
-        disabled={busy || !selectedFile || missingHeaders.length > 0}
+        disabled={busy || !selectedFile || missingRequiredHeaders.length > 0}
       >
         {busy ? 'Importing…' : 'Run Import'}
       </button>
