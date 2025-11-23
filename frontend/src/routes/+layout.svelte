@@ -98,6 +98,13 @@
           >🔎</button>
         {/if}
 
+        <!-- ⭐ NEW: Scan Cover (Camera) -->
+        <a
+          href="/scan-cover"
+          class="hover:opacity-80"
+          title="Scan album cover"
+        >📷</a>
+
         <!-- Utility (was Home) -->
         <a
           href="/utility"

@@ -1,30 +1,41 @@
-# ---------- Backend Dockerfile (vinyl/main/app/Dockerfile) ----------
+# ---------- Backend Dockerfile ----------
 FROM python:3.11-slim
 
-# App lives here in the image
 WORKDIR /app
 
-# Curl is used by the container healthcheck
+# System deps:
+# - curl for healthcheck
+# - lib* runtime libs for Pillow / torch
+# - git required for pip install from GitHub
 RUN apt-get update \
- && apt-get install -y --no-install-recommends curl \
+ && apt-get install -y --no-install-recommends \
+      curl \
+      git \
+      libglib2.0-0 \
+      libsm6 \
+      libxrender1 \
+      libxext6 \
  && rm -rf /var/lib/apt/lists/*
 
-# Install Python deps (requirements.txt is next to main.py)
+# Install Python deps from your requirements.txt
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the backend source (main.py, db.py, discogs.py, static/, etc.)
+# Extra deps for cover matching (CLIP + Torch + Pillow)
+RUN pip install --no-cache-dir \
+      torch \
+      torchvision \
+      pillow \
+      "git+https://github.com/openai/CLIP.git"
+
+# Copy backend source
 COPY . .
 
-# Runtime env
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Ensure a place for the DB if you're using VINYL_DB=/app/data/records.db
 RUN mkdir -p /app/data
 
-# Uvicorn will listen on 80 inside the container
 EXPOSE 80
 
-# Start FastAPI (main.py defines `app = FastAPI(...)`)
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--proxy-headers", "--forwarded-allow-ips", "*"]

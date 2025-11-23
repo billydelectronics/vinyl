@@ -11,6 +11,7 @@ services:
       - DISCOGS_TOKEN=${DISCOGS_TOKEN:-}
       - USER_AGENT=VinylRecordTracker/1.0
       - REQUEST_TIMEOUT=20
+      - CLIP_MODEL_NAME=ViT-L/14@336px
     volumes:
       - ./data:/app/data
     healthcheck:

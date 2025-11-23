@@ -1,10 +1,12 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
+  import { Camera } from 'lucide-svelte';
+  import { goto } from '$app/navigation';
 
   let undo: Array<() => void> = [];
   let mo: MutationObserver | null = null;
 
-  /** Hide non-read actions from the top nav 
+  /** Hide non-read actions from the top nav */
   function hideSelector(sel: string) {
     const els = Array.from(document.querySelectorAll<HTMLElement>(sel));
     for (const el of els) {
@@ -12,7 +14,7 @@
       el.style.display = 'none';
       undo.push(() => { el.style.display = prev; });
     }
-  } */
+  }
 
   /** Ensure a consistent Read-Only link beside Home in the top nav */
   function ensureReadOnlyTopNav() {
@@ -33,11 +35,42 @@
     undo.push(() => a.remove());
   }
 
+  /** ⭐ NEW: Add a camera icon button beside Read-Only */
+  function ensureScanCoverButton() {
+    const readLink = document.querySelector<HTMLAnchorElement>('a[href="/read"]');
+    if (!readLink) return;
+
+    // Avoid double-inserting
+    if (document.querySelector('#scan-cover-button')) return;
+
+    const btn = document.createElement('button');
+    btn.id = 'scan-cover-button';
+    btn.setAttribute(
+      'class',
+      readLink.getAttribute('class') ??
+        'px-2 py-1.5 text-sm rounded-md border border-zinc-700 hover:bg-zinc-800 flex items-center justify-center'
+    );
+    btn.style.display = 'flex';
+    btn.style.alignItems = 'center';
+    btn.style.justifyContent = 'center';
+
+    btn.title = 'Scan album cover';
+    btn.ariaLabel = 'Scan album cover';
+    btn.onclick = () => goto('/scan-cover');
+
+    // Add the actual Lucide camera icon
+    const icon = document.createElement('span');
+    icon.innerHTML = Camera.render().html; // lucide-svelte runtime SVG output
+    btn.appendChild(icon);
+
+    readLink.parentElement?.insertBefore(btn, readLink.nextSibling);
+    undo.push(() => btn.remove());
+  }
+
   /** Decide if an element is the back header or control */
   function looksLikeBack(el: HTMLElement): boolean {
     if (!el) return false;
 
-    // exact header shape from compiled HTML
     if (el.matches('header.flex.items-center.justify-between')) return true;
 
     if (el.matches('a,button')) {
@@ -48,7 +81,6 @@
       if (el.matches('a[href="/read"]')) return true;
     }
 
-    // wrapper rows that often contain the back control
     if (el.classList?.contains('mb-6') && el.querySelector('a,button')) return true;
 
     return false;
@@ -58,11 +90,8 @@
     const nodes = Array.from(
       root.querySelectorAll<HTMLElement>(
         [
-          // compiled structure
           '.p-6.space-y-6 > header.flex.items-center.justify-between',
-          // any anchor that looks like back-to-read
           'a[href="/read"]',
-          // common wrappers/controls
           'header.flex.items-center.justify-between',
           '.mb-6',
           'a',
@@ -84,11 +113,10 @@
   onMount(() => {
     hideSelector('a[href="/scan"], a[href="/import"], a[href="/export"]');
     ensureReadOnlyTopNav();
+    ensureScanCoverButton();   // ⭐ added
 
-    // Initial sweep (in case hydration inserts)
     removeBack(document);
 
-    // Observe for any reinsertions
     mo = new MutationObserver((muts) => {
       for (const m of muts) {
         m.addedNodes.forEach((n) => {
@@ -104,9 +132,9 @@
         });
       }
     });
+
     mo.observe(document.body, { childList: true, subtree: true });
 
-    // a couple timed sweeps as insurance
     [100, 300, 800, 1500].forEach((ms) => setTimeout(() => removeBack(document), ms));
   });
 
@@ -117,9 +145,7 @@
   });
 </script>
 
-<!-- GLOBAL CSS so SSR markup is hidden before paint -->
 <style>
-  /* Exact SSR structure from compiled file */
   :global(.p-6.space-y-6 > header.flex.items-center.justify-between) {
     display: none !important;
   }
@@ -127,7 +153,6 @@
     display: none !important;
   }
 
-  /* Extra catch-alls just in case */
   :global(header.flex.items-center.justify-between:has(a[href="/read"])) {
     display: none !important;
   }
@@ -135,9 +160,7 @@
   :global(.mb-6:has(button)) {
     display: none !important;
   }
-  :global(a[href="/read"]) {
-    /* hide any back-to-read anchor inside the content area */
-  }
+  :global(a[href="/read"]) { }
 </style>
 
 <slot />
