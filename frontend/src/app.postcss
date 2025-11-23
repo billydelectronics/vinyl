@@ -53,3 +53,39 @@ header.flex.items-center.justify-between:has(a[href="/read"]) {
         visibility: hidden;
     }
 } */
+
+/* Make the whole viewport always black */
+html, body {
+  background: #000;
+  color: #fff;
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+/* iOS Safari safe-area support */
+html {
+  background-color: #000;
+  height: 100%;
+}
+
+body {
+  background-color: #000;
+  min-height: 100vh;
+  min-height: -webkit-fill-available;
+}
+
+/* Fill iOS bottom white bar */
+:root {
+  --safe-area-inset-bottom: env(safe-area-inset-bottom);
+}
+
+body::after {
+  content: "";
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: var(--safe-area-inset-bottom);
+  background: #000; /* match site background */
+}

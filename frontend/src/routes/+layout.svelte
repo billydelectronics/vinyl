@@ -71,6 +71,8 @@
 <svelte:head>
   <title>Vinyl</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#000000" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 </svelte:head>
 
 <div class="min-h-screen bg-black text-white font-sans">
