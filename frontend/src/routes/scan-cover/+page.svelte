@@ -16,9 +16,21 @@
     score?: number | null;
   };
 
+  type BestMatch = {
+    id: number;
+    score: number;
+    gap_to_second: number;
+  };
+
+  // Supports both the old { match, score, candidates }
+  // and new { best, candidates, confident } shapes.
   type MatchResponse = {
-    match: number | null;
+    // legacy shape
+    match?: number | null;
     score?: number | null;
+    // new shape
+    best?: BestMatch | null;
+    confident?: boolean;
     candidates?: Candidate[];
   };
 
@@ -148,6 +160,7 @@
       const data = (await res.json()) as MatchResponse;
       lastResponse = data;
 
+      // --- 1) Legacy shape: { match, score } --------------------------------
       if (data.match != null) {
         infoMsg = 'High confidence match. Opening record…';
         setTimeout(() => {
@@ -156,6 +169,30 @@
         return;
       }
 
+      // --- 2) New shape: { best, candidates, confident } ---------------------
+      const best = data.best ?? null;
+
+      // Decide if it's a confident match:
+      //   - use 'confident' if backend provided it
+      //   - else fallback to score >= 0.80 and gap >= 0.10
+      let confident = false;
+      if (typeof data.confident === 'boolean') {
+        confident = data.confident;
+      } else if (best) {
+        const score = best.score ?? 0;
+        const gap = best.gap_to_second ?? 0;
+        confident = score >= 0.8 && gap >= 0.1;
+      }
+
+      if (best && confident) {
+        infoMsg = 'High confidence match. Opening record…';
+        setTimeout(() => {
+          goto(`/read/${best.id}`);
+        }, 250);
+        return;
+      }
+
+      // --- 3) Not confident: show candidates / messages ----------------------
       infoMsg = '';
       if (data.candidates && data.candidates.length > 0) {
         errorMsg =

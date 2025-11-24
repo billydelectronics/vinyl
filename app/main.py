@@ -22,31 +22,33 @@ USER_AGENT = os.environ.get("USER_AGENT", "VinylRecordTracker/1.0")
 REQUEST_TIMEOUT = float(os.environ.get("REQUEST_TIMEOUT", "20"))
 
 # =============================================================================
-# FastAPI app
+# App
 # =============================================================================
 
 app = FastAPI(title="Vinyl API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "*",
-    ],
+    allow_origins=["*"],   # tighten for prod
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =============================================================================
-# Simple health endpoints
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {"status": "ok", "ts": int(time.time())}
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {"status": "ok"}
 
 @app.get("/healthz")
 def healthz() -> Dict[str, Any]:
     return {"status": "ok", "ts": int(time.time())}
-
-@app.get("/health")
-def health_root() -> Dict[str, Any]:
-    return {"status": "ok"}
 
 @app.get("/api/health")
 def api_health() -> Dict[str, Any]:
@@ -126,20 +128,16 @@ def init_db() -> None:
 
 @app.on_event("startup")
 def on_startup() -> None:
-    folder = os.path.dirname(DB_PATH) or "."
-    os.makedirs(folder, exist_ok=True)
+    base = os.path.dirname(DB_PATH) or "."
+    os.makedirs(base, exist_ok=True)
     init_db()
 
 # =============================================================================
-# Basic DB utilities: records + tracks
+# Basic DB utilities
 # =============================================================================
 
-def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
-
 def fetch_record(conn: sqlite3.Connection, rid: int) -> sqlite3.Row:
-    cur = conn.cursor()
-    row = cur.execute("SELECT * FROM records WHERE id = ?", (rid,)).fetchone()
+    row = conn.execute("SELECT * FROM records WHERE id = ?", (rid,)).fetchone()
     if not row:
         raise HTTPException(404, detail="Record not found")
     return row
@@ -150,6 +148,53 @@ def db_get_record_or_404(rid: int) -> Dict[str, Any]:
     out = dict(row)
     conn.close()
     return out
+
+def db_patch_record(rid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not payload:
+        return db_get_record_or_404(rid)
+
+    conn = db()
+    cur = conn.cursor()
+    cols, vals = [], []
+    for k, v in payload.items():
+        cols.append(f"{k} = ?")
+        vals.append(v)
+    cols.append("updated_at = CURRENT_TIMESTAMP")
+    cur.execute(f"UPDATE records SET {', '.join(cols)} WHERE id = ?", (*vals, rid))
+    conn.commit()
+    row = fetch_record(conn, rid)
+    out = dict(row)
+    conn.close()
+    return out
+
+def db_insert_record(payload: Dict[str, Any]) -> Dict[str, Any]:
+    conn = db()
+    cur = conn.cursor()
+    keys = list(payload.keys())
+    vals = [payload[k] for k in keys]
+    placeholders = ", ".join("?" for _ in keys)
+    cur.execute(
+        f"INSERT INTO records ({', '.join(keys)}) VALUES ({placeholders})",
+        tuple(vals),
+    )
+    rid = cur.lastrowid
+    conn.commit()
+    row = fetch_record(conn, rid)
+    out = dict(row)
+    conn.close()
+    return out
+
+def db_delete_records(ids: List[int]) -> int:
+    if not ids:
+        return 0
+    conn = db()
+    cur = conn.cursor()
+    placeholders = ", ".join("?" for _ in ids)
+    cur.execute(f"DELETE FROM records WHERE id IN ({placeholders})", tuple(ids))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    return deleted
 
 def db_get_tracks(rid: int) -> List[Dict[str, Any]]:
     conn = db()
@@ -183,26 +228,20 @@ def db_replace_tracks(rid: int, tracks: List[Dict[str, Any]]) -> None:
     conn.commit()
     conn.close()
 
-def db_delete_records(ids: List[int]) -> int:
-    if not ids:
-        return 0
+def bump_record_updated(rid: int) -> None:
     conn = db()
-    cur = conn.cursor()
-    placeholders = ", ".join("?" for _ in ids)
-    cur.execute(f"DELETE FROM records WHERE id IN ({placeholders})", tuple(ids))
-    deleted = cur.rowcount
+    conn.execute("UPDATE records SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (rid,))
     conn.commit()
     conn.close()
-    return deleted
 
 # =============================================================================
-# Pydantic models
+# Models
 # =============================================================================
 
 class RecordIn(BaseModel):
-    artist: str = Field(..., description="Artist / performer")
-    title: str = Field(..., description="Album / release title")
-    year: Optional[int] = Field(None, description="Release year (if known)")
+    artist: str
+    title: str
+    year: Optional[int] = None
     label: Optional[str] = None
     format: Optional[str] = None
     country: Optional[str] = None
@@ -245,44 +284,22 @@ class TracksReplaceIn(BaseModel):
     tracks: List[TrackIn] = Field(default_factory=list)
 
 class DiscogsApplyIn(BaseModel):
-    release_id: Optional[int] = Field(None, description="Discogs release id to force")
+    release_id: Optional[int] = None
 
 # =============================================================================
 # Utility helpers
 # =============================================================================
 
-def to_int_or_none(s: Optional[str]) -> Optional[int]:
-    if s is None:
-        return None
-    s = s.strip()
-    if not s:
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        return None
-
-def parse_bool_param(s: Optional[str], default: bool = False) -> bool:
-    if s is None:
-        return default
-    s = s.strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return default
-
 def like_pattern(s: str) -> str:
     return f"%{s.replace('%', '%%')}%"
 
-def country_pref(row: sqlite3.Row) -> Optional[str]:
-    c = (row["country"] or "").strip()
-    if not c:
-        return None
-    return c.upper()
+def _nz(x: Any) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
 
 # =============================================================================
-# API: metadata
+# Meta
 # =============================================================================
 
 @app.get("/api/meta/schema")
@@ -290,7 +307,8 @@ def meta_schema() -> Dict[str, Any]:
     conn = db()
     cur = conn.cursor()
     rows = cur.execute("PRAGMA table_info(records)").fetchall()
-    cols: List[Dict[str, Any]] = []
+    conn.close()
+    cols = []
     for r in rows:
         cols.append(
             {
@@ -304,9 +322,110 @@ def meta_schema() -> Dict[str, Any]:
         )
     return {"columns": cols}
 
+@app.get("/api/meta/records/schema")
+def meta_records_schema() -> Dict[str, Any]:
+    return meta_schema()
+
+# =============================================================================
+# Records listing + CRUD
+# =============================================================================
+
+@app.get("/api/records")
+def list_records(
+    search: Optional[str] = Query(None),
+    sort_key: Optional[str] = Query("artist"),
+    sort_dir: Optional[str] = Query("asc"),
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    where_clauses: List[str] = []
+    params: List[Any] = []
+
+    if search:
+        like = like_pattern(search)
+        where_clauses.append(
+            "(artist LIKE ? OR title LIKE ? OR label LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)"
+        )
+        params.extend([like, like, like, like, like])
+
+    where_sql = ""
+    if where_clauses:
+        where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    allowed_sort = {"artist", "title", "year", "label", "country", "created_at", "updated_at"}
+    if sort_key not in allowed_sort:
+        sort_key = "artist"
+    sort_dir = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
+
+    conn = db()
+    cur = conn.cursor()
+    sql_base = f"FROM records {where_sql}"
+    total = cur.execute(f"SELECT COUNT(*) {sql_base}", params).fetchone()[0]
+
+    sql = f"SELECT * {sql_base} ORDER BY {sort_key} COLLATE NOCASE {sort_dir}, id"
+    rows = cur.execute(sql, (*params,)).fetchall()
+    conn.close()
+
+    items = [dict(r) for r in rows]
+    return {"items": items, "total": total}
+
+def derive_year_from_release_detail(detail: Dict[str, Any]) -> Optional[int]:
+    year_val = detail.get("year")
+    year_str: Optional[str]
+    if year_val is not None:
+        year_str = str(year_val).strip()
+    else:
+        released = detail.get("released")
+        if not released:
+            return None
+        year_str = str(released).strip()[:4]
+    try:
+        return int(year_str)
+    except Exception:
+        return None
+
+def derive_year_from_discogs_release(release_id: Optional[int]) -> Optional[int]:
+    if not release_id:
+        return None
+    try:
+        detail = discogs_release_details(int(release_id))
+    except HTTPException:
+        return None
+    except Exception:
+        return None
+    return derive_year_from_release_detail(detail)
+
+@app.post("/api/records")
+def create_record(payload: RecordIn = Body(...)) -> Dict[str, Any]:
+    # Default country + format for new manual records
+    if not (payload.country or "").strip():
+        payload.country = "US"
+    if not (payload.format or "").strip():
+        payload.format = "LP"
+
+    data = payload.dict()
+    # If no year but we have a Discogs release/record id, try to derive a year
+    if not data.get("year"):
+        release_id = data.get("discogs_release_id") or data.get("discogs_id")
+        year = derive_year_from_discogs_release(release_id)
+        if year is not None:
+            data["year"] = year
+
+    return db_insert_record(data)
+
 @app.get("/api/records/{rid}")
 def get_record(rid: int) -> Dict[str, Any]:
     return db_get_record_or_404(rid)
+
+@app.patch("/api/records/{rid}")
+def patch_record(rid: int, payload: RecordPatch = Body(...)) -> Dict[str, Any]:
+    existing = db_get_record_or_404(rid)
+    update_data = payload.dict(exclude_unset=True)
+    merged = dict(existing)
+    for k, v in update_data.items():
+        merged[k] = v
+    merged.pop("id", None)
+    return db_patch_record(rid, merged)
 
 @app.delete("/api/records/{rid}")
 def delete_record(rid: int) -> Dict[str, Any]:
@@ -319,13 +438,12 @@ def bulk_delete_records(ids: List[int] = Body(...)) -> Dict[str, Any]:
     return {"deleted": deleted}
 
 # =============================================================================
-# CSV export / import
+# CSV import/export
 # =============================================================================
 
 @app.get("/api/meta/import-template")
 def meta_import_template() -> Response:
     headers = [
-        "id",
         "artist",
         "title",
         "year",
@@ -343,21 +461,23 @@ def meta_import_template() -> Response:
         "album_notes",
         "personal_notes",
     ]
-    outf = io.StringIO()
-    writer = csv.writer(outf)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
     writer.writerow(headers)
-    data = outf.getvalue().encode("utf-8")
+    csv_bytes = buf.getvalue().encode("utf-8")
     return Response(
-        content=data,
+        content=csv_bytes,
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="import_template.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="vinyl_import_template.csv"'},
     )
 
 @app.get("/api/records/export")
 def export_records() -> Response:
     conn = db()
     cur = conn.cursor()
-    rows = cur.execute("SELECT * FROM records ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE, id").fetchall()
+    rows = cur.execute(
+        "SELECT * FROM records ORDER BY artist COLLATE NOCASE, title COLLATE NOCASE, id"
+    ).fetchall()
 
     headers = [
         "id",
@@ -379,8 +499,8 @@ def export_records() -> Response:
         "personal_notes",
     ]
 
-    outf = io.StringIO()
-    writer = csv.writer(outf)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
     writer.writerow(headers)
     for r in rows:
         row = [r["id"]]
@@ -388,95 +508,130 @@ def export_records() -> Response:
             row.append(r[col])
         writer.writerow(row)
 
-    data = outf.getvalue().encode("utf-8")
+    csv_bytes = buf.getvalue().encode("utf-8")
     conn.close()
     return Response(
-        content=data,
+        content=csv_bytes,
         media_type="text/csv",
-        headers={"Content-Disposition": 'attachment; filename="records_export.csv"'},
+        headers={"Content-Disposition": 'attachment; filename="vinyl_records_export.csv"'},
     )
 
-@app.post("/api/records/import")
-def import_records(file: UploadFile = File(...)) -> Dict[str, Any]:
-    content = file.file.read()
-    file.file.close()
+@app.post("/api/import/csv")
+async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Import CSV rows into the records table.
+
+    Defaults:
+      - country -> "US" if missing/blank
+      - format  -> "LP" if missing/blank
+    """
+    def to_int_or_none(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        if isinstance(v, int):
+            return v
+        s = str(v or "").strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except Exception:
+            return None
+
+    def nz(s: Any) -> str:
+        if s is None:
+            return ""
+        return str(s).strip()
+
+    raw_bytes = await file.read()
     try:
-        text = content.decode("utf-8")
+        text = raw_bytes.decode("utf-8-sig")
     except Exception:
-        raise HTTPException(400, detail="Expected UTF-8 CSV")
+        raise HTTPException(400, detail="Could not decode CSV as UTF-8")
 
-    reader = csv.DictReader(io.StringIO(text))
-    required_columns = {"artist", "title"}
-    for col in required_columns:
-        if col not in reader.fieldnames:
-            raise HTTPException(400, detail=f"Missing required column: {col}")
+    reader = csv.reader(io.StringIO(text))
+    try:
+        header = next(reader)
+    except StopIteration:
+        raise HTTPException(400, detail="CSV file is empty")
 
-    conn = db()
-    cur = conn.cursor()
+    header_map: Dict[str, str] = {}
+    for col in header:
+        key = (col or "").strip().lower()
+        if not key:
+            continue
+        header_map[key] = col
+
+    required = ["artist", "title"]
+    for r in required:
+        if r not in header_map:
+            raise HTTPException(400, detail=f"Missing required column '{r}'")
 
     rows_imported = 0
     for row in reader:
-        artist = (row.get("artist") or "").strip()
-        title = (row.get("title") or "").strip()
+        rec: Dict[str, Any] = {}
+        for key, orig_col in header_map.items():
+            idx = header.index(orig_col)
+            val = row[idx] if idx < len(row) else ""
+
+            if key == "artist":
+                rec["artist"] = nz(val)
+            elif key == "title":
+                rec["title"] = nz(val)
+            elif key == "year":
+                rec["year"] = to_int_or_none(val)
+            elif key == "label":
+                rec["label"] = nz(val)
+            elif key == "format":
+                rec["format"] = nz(val)
+            elif key == "country":
+                rec["country"] = nz(val)
+            elif key == "catalog_number":
+                rec["catalog_number"] = nz(val)
+            elif key == "barcode":
+                rec["barcode"] = nz(val)
+            elif key == "discogs_id":
+                rec["discogs_id"] = to_int_or_none(val)
+            elif key == "discogs_release_id":
+                rec["discogs_release_id"] = to_int_or_none(val)
+            elif key == "discogs_thumb":
+                rec["discogs_thumb"] = nz(val)
+            elif key == "cover_url":
+                rec["cover_url"] = nz(val)
+            elif key == "cover_local":
+                rec["cover_local"] = nz(val)
+            elif key == "cover_url_auto":
+                rec["cover_url_auto"] = nz(val)
+            elif key == "album_notes":
+                rec["album_notes"] = nz(val)
+            elif key == "personal_notes":
+                rec["personal_notes"] = nz(val)
+
+        artist = nz(rec.get("artist"))
+        title = nz(rec.get("title"))
         if not artist or not title:
             continue
 
-        rec: Dict[str, Any] = {
-            "artist": artist,
-            "title": title,
-            "year": to_int_or_none(row.get("year")),
-            "label": (row.get("label") or "").strip() or None,
-            "format": (row.get("format") or "").strip() or None,
-            "country": (row.get("country") or "").strip() or None,
-            "catalog_number": (row.get("catalog_number") or "").strip() or None,
-            "barcode": (row.get("barcode") or "").strip() or None,
-            "discogs_id": to_int_or_none(row.get("discogs_id")),
-            "discogs_release_id": to_int_or_none(row.get("discogs_release_id")),
-            "discogs_thumb": (row.get("discogs_thumb") or "").strip() or None,
-            "cover_url": (row.get("cover_url") or "").strip() or None,
-            "cover_local": (row.get("cover_local") or "").strip() or None,
-            "cover_url_auto": (row.get("cover_url_auto") or "").strip() or None,
-            "album_notes": (row.get("album_notes") or "").strip() or None,
-            "personal_notes": (row.get("personal_notes") or "").strip() or None,
-        }
+        if "country" not in rec or not nz(rec["country"]):
+            rec["country"] = "US"
+        if "format" not in rec or not nz(rec["format"]):
+            rec["format"] = "LP"
 
-        cur.execute(
-            """
-            INSERT INTO records (
-              artist, title, year, label, format, country,
-              catalog_number, barcode, discogs_id, discogs_release_id,
-              discogs_thumb, cover_url, cover_local, cover_url_auto,
-              album_notes, personal_notes
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                rec["artist"],
-                rec["title"],
-                rec["year"],
-                rec["label"],
-                rec["format"],
-                rec["country"],
-                rec["catalog_number"],
-                rec["barcode"],
-                rec["discogs_id"],
-                rec["discogs_release_id"],
-                rec["discogs_thumb"],
-                rec["cover_url"],
-                rec["cover_local"],
-                rec["cover_url_auto"],
-                rec["album_notes"],
-                rec["personal_notes"],
-            ),
-        )
+        # Derive year from Discogs if missing
+        if not rec.get("year"):
+            release_id = rec.get("discogs_release_id") or rec.get("discogs_id")
+            if release_id is not None:
+                yr = derive_year_from_discogs_release(release_id)
+                if yr is not None:
+                    rec["year"] = yr
+
+        db_insert_record(rec)
         rows_imported += 1
 
-    conn.commit()
-    conn.close()
     return {"imported": rows_imported}
 
 # =============================================================================
-# Tracks: simple APIs
+# Tracks APIs
 # =============================================================================
 
 @app.get("/api/records/{rid}/tracks")
@@ -489,150 +644,11 @@ def api_tracks_replace(rid: int, body: TracksReplaceIn) -> Dict[str, Any]:
     _ = db_get_record_or_404(rid)
     items = [{"side": t.side, "position": t.position, "title": t.title, "duration": t.duration} for t in body.tracks]
     db_replace_tracks(rid, items)
+    bump_record_updated(rid)
     return {"ok": True, "count": len(items)}
 
 # =============================================================================
-# API: listing / filtering records for read UI
-# =============================================================================
-
-class ListRecordsResponse(BaseModel):
-    items: List[Dict[str, Any]]
-    total: int
-
-@app.get("/api/records")
-def list_records(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=500),
-    search: Optional[str] = Query(None),
-    folder: Optional[str] = Query(None),
-    sort_key: str = Query("artist"),
-    sort_dir: str = Query("asc"),
-) -> ListRecordsResponse:
-    offset = (page - 1) * page_size
-    conn = db()
-    cur = conn.cursor()
-
-    where_clauses = []
-    params: List[Any] = []
-
-    if search:
-        like = like_pattern(search)
-        where_clauses.append(
-            "(artist LIKE ? OR title LIKE ? OR label LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)"
-        )
-        params.extend([like, like, like, like, like])
-
-    if folder:
-        where_clauses.append("country = ?")
-        params.append(folder)
-
-    where_sql = ""
-    if where_clauses:
-        where_sql = "WHERE " + " AND ".join(where_clauses)
-
-    sort_col = "artist"
-    if sort_key in ("artist", "title", "year", "label", "country"):
-        sort_col = sort_key
-
-    sort_dir_sql = "ASC"
-    if sort_dir.lower() == "desc":
-        sort_dir_sql = "DESC"
-
-    total = cur.execute(f"SELECT COUNT(*) AS c FROM records {where_sql}", params).fetchone()["c"]
-
-    rows = cur.execute(
-        f"""
-        SELECT *
-        FROM records
-        {where_sql}
-        ORDER BY {sort_col} COLLATE NOCASE {sort_dir_sql}, id
-        LIMIT ? OFFSET ?
-        """,
-        params + [page_size, offset],
-    ).fetchall()
-
-    items = [dict(r) for r in rows]
-    conn.close()
-    return ListRecordsResponse(items=items, total=total)
-
-# =============================================================================
-# API: create / patch records
-# =============================================================================
-
-def db_insert_record(rec: Dict[str, Any]) -> int:
-    conn = db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO records (
-          artist, title, year, label, format, country,
-          catalog_number, barcode, discogs_id, discogs_release_id,
-          discogs_thumb, cover_url, cover_local, cover_url_auto,
-          album_notes, personal_notes
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            rec.get("artist"),
-            rec.get("title"),
-            rec.get("year"),
-            rec.get("label"),
-            rec.get("format"),
-            rec.get("country"),
-            rec.get("catalog_number"),
-            rec.get("barcode"),
-            rec.get("discogs_id"),
-            rec.get("discogs_release_id"),
-            rec.get("discogs_thumb"),
-            rec.get("cover_url"),
-            rec.get("cover_local"),
-            rec.get("cover_url_auto"),
-            rec.get("album_notes"),
-            rec.get("personal_notes"),
-        ),
-    )
-    new_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-    return new_id
-
-def db_patch_record(rid: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not payload:
-        return db_get_record_or_404(rid)
-
-    columns = []
-    values: List[Any] = []
-    for key, val in payload.items():
-        columns.append(f"{key} = ?")
-        values.append(val)
-
-    values.append(rid)
-
-    conn = db()
-    cur = conn.cursor()
-    sql = f"UPDATE records SET {', '.join(columns)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
-    cur.execute(sql, values)
-    conn.commit()
-    conn.close()
-    return db_get_record_or_404(rid)
-
-@app.post("/api/records")
-def create_record(body: RecordIn) -> Dict[str, Any]:
-    rec = body.dict()
-    new_id = db_insert_record(rec)
-    return db_get_record_or_404(new_id)
-
-@app.patch("/api/records/{rid}")
-def patch_record(rid: int, body: RecordPatch) -> Dict[str, Any]:
-    rec = db_get_record_or_404(rid)
-    payload: Dict[str, Any] = {}
-    for field_name, value in body.dict(exclude_unset=True).items():
-        payload[field_name] = value
-    updated = db_patch_record(rid, payload)
-    return updated
-
-# =============================================================================
-# Discogs + HTTP helpers
+# Discogs HTTP helpers
 # =============================================================================
 
 def _discogs_headers() -> Dict[str, str]:
@@ -661,201 +677,36 @@ def _http_get(url: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, An
 def discogs_release_details(release_id: int) -> Dict[str, Any]:
     return _http_get(f"{DISCOGS_API}/releases/{release_id}")
 
-def _nz(x: Any) -> str:
-    if x is None:
-        return ""
-    s = str(x).strip()
-    return s
-
 def _fmt_tokens_from_release_detail(detail: Dict[str, Any]) -> List[str]:
     tokens: List[str] = []
-    for fmt in detail.get("formats") or []:
-        name = _nz(fmt.get("name"))
-        if name:
-            tokens.append(name.lower())
-        for d in fmt.get("descriptions") or []:
-            d = _nz(d)
-            if d:
-                tokens.append(d.lower())
+    for f in (detail.get("formats") or []):
+        name = _nz(f.get("name")).lower()
+        desc = [str(x).lower() for x in (f.get("descriptions") or [])]
+        tokens.extend([name, *desc])
     return tokens
 
-def _is_lp_format(detail: Dict[str, Any]) -> bool:
-    tokens = _fmt_tokens_from_release_detail(detail)
-    if "lp" in tokens or "album" in tokens:
-        return True
-    if "vinyl" in tokens and "12\"" in tokens:
-        return True
-    return False
-
-def _country_from_release_detail(detail: Dict[str, Any]) -> Optional[str]:
-    c = _nz(detail.get("country"))
-    if not c:
-        return None
-    return c.upper()
-
-def _year_from_release_detail(detail: Dict[str, Any]) -> Optional[int]:
-    y = to_int_or_none(_nz(detail.get("year")))
-    return y
-
-def _score_candidate(row: sqlite3.Row, detail: Dict[str, Any]) -> int:
-    score = 0
-
-    artist = _nz(row["artist"]).lower()
-    title = _nz(row["title"]).lower()
-    country_pref_val = country_pref(row)
-    year_pref = row["year"]
-
-    artists = ", ".join([_nz(a.get("name")) for a in detail.get("artists", []) or []]).lower()
-    if artist and artist in artists:
-        score += 30
-
-    title_detail = _nz(detail.get("title")).lower()
-    if title and title in title_detail:
-        score += 30
-
-    if country_pref_val and _country_from_release_detail(detail) == country_pref_val:
-        score += 20
-
-    y = _year_from_release_detail(detail)
-    if y and year_pref and abs(y - year_pref) <= 1:
-        score += 10
-
-    if _is_lp_format(detail):
-        score += 10
-
-    return score
-
-def discogs_query_plan_for_row(row: sqlite3.Row) -> List[Dict[str, Any]]:
-    artist = _nz(row["artist"])
-    title = _nz(row["title"])
-    country = country_pref(row)
-
-    base_q = f"{artist} {title}".strip()
-
-    plans: List[Dict[str, Any]] = []
-
-    plans.append(
-        {
-            "q": base_q,
-            "type": "release",
-            "format": "LP",
-            "per_page": 50,
-        }
-    )
-
-    if country:
-        plans.append(
-            {
-                "q": base_q,
-                "type": "release",
-                "format": "LP",
-                "country": country,
-                "per_page": 50,
-            }
-        )
-
-    if row["catalog_number"]:
-        plans.append(
-            {
-                "catno": row["catalog_number"],
-                "type": "release",
-                "per_page": 50,
-            }
-        )
-
-    if row["barcode"]:
-        plans.append(
-            {
-                "barcode": row["barcode"],
-                "type": "release",
-                "per_page": 50,
-            }
-        )
-
-    return plans
-
-def candidate_allowed_search(result_row: Dict[str, Any], required_country: Optional[str]) -> bool:
-    fmts = [(_nz(f)).lower() for f in (result_row.get("format") or [])]
-    if fmts:
-        if not any("lp" in f or "album" in f for f in fmts):
-            return False
-
+def candidate_allowed_release(detail: Dict[str, Any], required_country: Optional[str]) -> bool:
+    tokens = set(_fmt_tokens_from_release_detail(detail))
+    if "lp" not in tokens:
+        return False
     if required_country:
-        c = _nz(result_row.get("country")).upper()
-        if c and c != required_country:
+        if _nz(detail.get("country")).upper() != required_country.upper():
             return False
-
     return True
 
-def derive_best_release_id_for_record(rid: int) -> Optional[int]:
-    row = db_get_record_or_404(rid)
-    required_country = country_pref(row)
+def candidate_allowed_search(item: Dict[str, Any], required_country: Optional[str]) -> bool:
+    fmt = " ".join((item.get("format") or [])).lower()
+    if "lp" not in fmt and "vinyl" not in fmt:
+        return False
+    if required_country:
+        c = _nz(item.get("country")).upper()
+        if c and c != required_country.upper():
+            return False
+    return True
 
-    best_id: Optional[int] = None
-    best_score = -1
-
-    for params in discogs_query_plan_for_row(row):
-        js = _http_get(f"{DISCOGS_API}/database/search", params)
-        for r in js.get("results") or []:
-            release_id = r.get("id")
-            if not release_id:
-                continue
-
-            try:
-                detail = discogs_release_details(int(release_id))
-            except HTTPException:
-                continue
-
-            if not _is_lp_format(detail):
-                continue
-
-            if required_country and _country_from_release_detail(detail) != required_country:
-                continue
-
-            score = _score_candidate(row, detail)
-            if score > best_score:
-                best_score = score
-                best_id = int(release_id)
-
-        if best_id is not None and best_score >= 40:
-            break
-
-    return best_id
-
-# Discogs search helpers used by the picker UI
-# =============================================================================
-
-@app.get("/api/records/{rid}/discogs/search")
-def api_discogs_search_for_record(rid: int) -> Dict[str, Any]:
-    row = db_get_record_or_404(rid)
-    required_country = country_pref(row)
-
-    out: List[Dict[str, Any]] = []
-    for params in discogs_query_plan_for_row(row):
-        js = _http_get(f"{DISCOGS_API}/database/search", params)
-        for r in js.get("results") or []:
-            if not candidate_allowed_search(r, required_country):
-                continue
-            out.append({
-                "id": r.get("id"),
-                "title": r.get("title"),
-                "year": r.get("year"),
-                "country": r.get("country"),
-                "label": r.get("label"),
-                "format": r.get("format"),
-                "thumb": r.get("thumb"),
-            })
-        if out:
-            break
-    return {"results": out}
-
-@app.get("/api/discogs/release/{release_id}")
-def api_discogs_release_preview(release_id: int) -> Dict[str, Any]:
-    return discogs_release_details(release_id)
-
-# =============================================================================
-# API: Discogs cover + tracks  (LP-only + required country)
-# =============================================================================
+def country_pref(row: Dict[str, Any]) -> str:
+    c = _nz(row.get("country")).upper()
+    return c or "US"
 
 def pick_best_image(detail: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     images = detail.get("images") or []
@@ -880,23 +731,184 @@ def pick_best_image(detail: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
 
     return winner.get("uri"), winner.get("uri150")
 
-@app.post("/api/records/{rid}/discogs/apply")
-def api_discogs_apply(rid: int, body: Optional[DiscogsApplyIn] = Body(None)) -> Dict[str, Any]:
+# =============================================================================
+# Discogs search logic
+# =============================================================================
+
+def discogs_query_plan_for_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
+    artist = _nz(row.get("artist"))
+    title = _nz(row.get("title"))
+    year  = _nz(row.get("year"))
+    cat   = _nz(row.get("catalog_number"))
+    bc    = _nz(row.get("barcode"))
+
+    base_q = f"{artist} {title}".strip()
+    plans: List[Dict[str, Any]] = []
+
+    if base_q:
+        plans.append(
+            {
+                "q": base_q,
+                "type": "release",
+                "format": "LP",
+                "per_page": 50,
+            }
+        )
+        if year:
+            plans.append(
+                {
+                    "q": f"{base_q} {year}",
+                    "type": "release",
+                    "format": "LP",
+                    "per_page": 50,
+                }
+            )
+
+    if cat:
+        plans.append(
+            {
+                "catno": cat,
+                "type": "release",
+                "per_page": 50,
+            }
+        )
+
+    if bc:
+        plans.append(
+            {
+                "barcode": bc,
+                "type": "release",
+                "per_page": 50,
+            }
+        )
+
+    return plans
+
+def discogs_fetch_and_score_candidates(row: Dict[str, Any]) -> List[Tuple[int, int]]:
+    artist = _nz(row.get("artist")).lower()
+    title = _nz(row.get("title")).lower()
+    country = country_pref(row)
+    year = row.get("year")
+
+    def score_candidate(detail: Dict[str, Any]) -> int:
+        s = 0
+        artists_detail = ", ".join([_nz(a.get("name")) for a in (detail.get("artists") or [])]).lower()
+        if artist and artist in artists_detail:
+            s += 30
+        title_detail = _nz(detail.get("title")).lower()
+        if title and title in title_detail:
+            s += 30
+
+        if country and _nz(detail.get("country")).upper() == country.upper():
+            s += 10
+
+        rel_year = detail.get("year")
+        try:
+            y_rec = int(year) if year is not None else None
+        except Exception:
+            y_rec = None
+        try:
+            y_rel = int(rel_year) if rel_year is not None else None
+        except Exception:
+            y_rel = None
+        if y_rec is not None and y_rel is not None and abs(y_rec - y_rel) <= 1:
+            s += 10
+        return s
+
+    best: List[Tuple[int, int]] = []
+
+    for params in discogs_query_plan_for_row(row):
+        js = _http_get(f"{DISCOGS_API}/database/search", params)
+        for item in js.get("results", []) or []:
+            if not candidate_allowed_search(item, country):
+                continue
+            rel_id = item.get("id")
+            if not rel_id:
+                continue
+            try:
+                detail = discogs_release_details(int(rel_id))
+            except HTTPException:
+                continue
+            except Exception:
+                continue
+
+            if not candidate_allowed_release(detail, country):
+                continue
+
+            s = score_candidate(detail)
+            best.append((int(rel_id), s))
+
+        if best:
+            break
+
+    best.sort(key=lambda x: x[1], reverse=True)
+    return best
+
+def derive_best_release_id_for_record(rid: int) -> Optional[int]:
     row = db_get_record_or_404(rid)
+    candidates = discogs_fetch_and_score_candidates(row)
+    if not candidates:
+        return None
+    return candidates[0][0]
+
+@app.get("/api/records/{rid}/discogs/search")
+def api_discogs_search_for_record(rid: int) -> Dict[str, Any]:
+    row = db_get_record_or_404(rid)
+    required_country = country_pref(row)
+
+    out: List[Dict[str, Any]] = []
+    for params in discogs_query_plan_for_row(row):
+        js = _http_get(f"{DISCOGS_API}/database/search", params)
+        for r in js.get("results") or []:
+            if not candidate_allowed_search(r, required_country):
+                continue
+            out.append(
+                {
+                    "id": r.get("id"),
+                    "title": r.get("title"),
+                    "year": r.get("year"),
+                    "country": r.get("country"),
+                    "label": r.get("label"),
+                    "format": r.get("format"),
+                    "thumb": r.get("thumb"),
+                }
+            )
+        if out:
+            break
+    return {"results": out}
+
+@app.get("/api/discogs/release/{release_id}")
+def api_discogs_release_preview(release_id: int) -> Dict[str, Any]:
+    return discogs_release_details(release_id)
+
+@app.post("/api/records/{rid}/cover/fetch")
+def api_cover_fetch(rid: int, body: Optional[DiscogsApplyIn] = Body(None)) -> Dict[str, Any]:
+    _ = db_get_record_or_404(rid)
+
     if body and body.release_id:
         release_id = int(body.release_id)
     else:
         release_id = derive_best_release_id_for_record(rid)
-        if not release_id:
-            raise HTTPException(404, detail="No suitable Discogs LP release found")
 
+    if not release_id:
+        raise HTTPException(404, detail="No suitable Discogs LP release found for required country")
+
+    row = db_get_record_or_404(rid)
     detail = discogs_release_details(release_id)
+    if not candidate_allowed_release(detail, country_pref(row)):
+        raise HTTPException(404, detail="Chosen release does not satisfy LP + country constraint")
+
+    # If the record doesn't have a year yet, derive it from this release
+    if not row.get("year"):
+        yr = derive_year_from_release_detail(detail)
+        if yr is not None:
+            db_patch_record(rid, {"year": yr})
+
     cover_url_auto, discogs_thumb = pick_best_image(detail)
     if not cover_url_auto and not discogs_thumb:
-        raise HTTPException(404, detail="No cover image found for Discogs release")
+        raise HTTPException(404, detail="Matching release has no images")
 
     payload: Dict[str, Any] = {
-        "discogs_id": int(detail.get("id") or release_id),
         "discogs_release_id": int(detail.get("id") or release_id),
         "cover_url_auto": cover_url_auto,
     }
@@ -913,23 +925,31 @@ def api_tracks_save(rid: int, body: Optional[DiscogsApplyIn] = Body(None)) -> Di
         release_id = int(body.release_id)
     else:
         release_id = derive_best_release_id_for_record(rid)
-        if not release_id:
-            raise HTTPException(404, detail="No suitable Discogs LP release found for required country")
 
+    if not release_id:
+        raise HTTPException(404, detail="No suitable Discogs LP release found for required country")
+
+    row = db_get_record_or_404(rid)
     detail = discogs_release_details(release_id)
+    if not candidate_allowed_release(detail, country_pref(row)):
+        raise HTTPException(404, detail="Chosen release does not satisfy LP + country constraint")
+
+    # If the record doesn't have a year yet, derive it from this release
+    if not row.get("year"):
+        yr = derive_year_from_release_detail(detail)
+        if yr is not None:
+            db_patch_record(rid, {"year": yr})
+
     tracks = discogs_fetch_tracklist_for_release(release_id, detail)
-    items = [{"side": t["side"], "position": t["position"], "title": t["title"], "duration": t["duration"]} for t in tracks]
+    items = [
+        {"side": t["side"], "position": t["position"], "title": t["title"], "duration": t["duration"]}
+        for t in tracks
+    ]
     db_replace_tracks(rid, items)
+    bump_record_updated(rid)
     return {"ok": True, "count": len(tracks)}
 
-# =============================================================================
-# Tracklist extraction (reused)
-# =============================================================================
-
 def discogs_fetch_tracklist_for_release(release_id: int, detail: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    """
-    Accepts optional pre-fetched release detail to avoid a second HTTP call.
-    """
     rel = detail or discogs_release_details(release_id)
     out: List[Dict[str, Any]] = []
     for t in rel.get("tracklist", []) or []:
@@ -937,10 +957,8 @@ def discogs_fetch_tracklist_for_release(release_id: int, detail: Optional[Dict[s
         title = (t.get("title") or "").strip()
         duration = (t.get("duration") or "").strip()
         side = "A"
-        if pos:
-            first = pos[0].upper()
-            if first.isalpha():
-                side = first
+        if pos and pos[0].isalpha():
+            side = pos[0].upper()
         out.append(
             {
                 "side": side,
@@ -952,15 +970,12 @@ def discogs_fetch_tracklist_for_release(release_id: int, detail: Optional[Dict[s
     return out
 
 # =============================================================================
-# Cover image proxy + embedding storage
+# CLIP (MPS / CUDA / CPU)
 # =============================================================================
-
-CLIP_ENABLED = bool(os.environ.get("CLIP_ENABLED", "").strip())
-CLIP_MODEL_NAME = os.environ.get("CLIP_MODEL_NAME", "ViT-B/32")
 
 _CLIP_MODEL = None
 _CLIP_PREPROCESS = None
-_CLIP_DEVICE = "cpu"
+_CLIP_DEVICE = None
 
 def get_clip_model():
     """
@@ -976,16 +991,15 @@ def get_clip_model():
         return _CLIP_MODEL, _CLIP_PREPROCESS, _CLIP_DEVICE
 
     try:
-        import torch  # type: ignore
-        import clip   # type: ignore
+        import torch
+        import clip
     except Exception as e:
         raise HTTPException(500, detail=f"CLIP dependencies not available: {e}")
 
-    # Device selection: CUDA > MPS (Apple Silicon) > CPU
     if torch.cuda.is_available():
         device = "cuda"
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = "mps"   # Uses Apple GPU via Metal Performance Shaders (not Neural Engine)
+        device = "mps"
     else:
         device = "cpu"
 
@@ -999,28 +1013,23 @@ def get_clip_model():
     return model, preprocess, device
 
 def compute_image_embedding(image_bytes: bytes) -> List[float]:
-    """
-    Compute a normalized image embedding vector from raw image bytes using CLIP.
-    """
     try:
-        from PIL import Image  # type: ignore
-        import torch           # type: ignore
+        from PIL import Image
+        import torch
     except Exception as e:
         raise HTTPException(500, detail=f"Image/torch dependencies not available: {e}")
 
     from io import BytesIO
 
     model, preprocess, device = get_clip_model()
-
     img = Image.open(BytesIO(image_bytes)).convert("RGB")
     img_t = preprocess(img).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        emb = model.encode_image(img_t)
-        emb = emb / emb.norm(dim=-1, keepdim=True)
-        vec = emb[0].cpu().numpy().astype("float32")
-
-    return vec.tolist()
+        features = model.encode_image(img_t)
+        features = features / features.norm(dim=-1, keepdim=True)
+        vec: List[float] = features[0].cpu().tolist()
+    return vec
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     if not a or not b or len(a) != len(b):
@@ -1036,6 +1045,41 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
         return 0.0
     return dot / math.sqrt(na * nb)
 
+# =============================================================================
+# Cover proxy + cover-match + embeddings rebuild
+# =============================================================================
+
+def get_cover_bytes_for_record(row: sqlite3.Row) -> Optional[bytes]:
+    """
+    Try local cover_local (file path under DB folder) then URLs.
+    """
+    # Local file path
+    path = (row["cover_local"] or "").strip()
+    if path:
+        try:
+            base = os.path.dirname(DB_PATH) or "."
+            path = os.path.join(base, path)
+            with open(path, "rb") as f:
+                return f.read()
+        except Exception:
+            pass
+
+    url = row["cover_url"] or row["cover_url_auto"] or row["discogs_thumb"]
+    if not url:
+        return None
+
+    try:
+        import requests
+    except Exception as e:
+        raise HTTPException(500, detail=f"'requests' not installed: {e}")
+
+    try:
+        resp = requests.get(url, headers=_discogs_headers(), timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
+
 @app.get("/api/records/{rid}/cover/proxy")
 def cover_proxy(rid: int) -> Response:
     conn = db()
@@ -1045,113 +1089,163 @@ def cover_proxy(rid: int) -> Response:
         conn.close()
         raise HTTPException(404, detail="Record not found")
 
-    url = row["cover_url"] or row["cover_url_auto"] or row["discogs_thumb"]
-    if not url:
-        conn.close()
-        raise HTTPException(404, detail="No cover URL available")
-
-    try:
-        import requests
-    except Exception as e:
-        conn.close()
-        raise HTTPException(500, detail=f"'requests' not installed: {e}")
-
-    headers = _discogs_headers()
-    try:
-        resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(502, detail=f"Error fetching cover: {e}")
-
-    content_type = resp.headers.get("Content-Type", "image/jpeg")
-    data = resp.content
+    data = get_cover_bytes_for_record(row)
     conn.close()
-    return Response(content=data, media_type=content_type)
+    if not data:
+        raise HTTPException(404, detail="No cover data available")
 
-@app.post("/api/records/{rid}/cover/embedding")
-def compute_cover_embedding(rid: int) -> Dict[str, Any]:
-    if not CLIP_ENABLED:
-        raise HTTPException(400, detail="CLIP embedding disabled (set CLIP_ENABLED=1 to enable)")
+    return Response(content=data, media_type="image/jpeg")
 
-    conn = db()
-    cur = conn.cursor()
-    row = cur.execute("SELECT * FROM records WHERE id = ?", (rid,)).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(404, detail="Record not found")
+def get_all_cover_embeddings(conn: sqlite3.Connection) -> List[Tuple[int, List[List[float]]]]:
+    """
+    Return all stored cover embeddings as (record_id, [vectors...]) pairs.
+    Each record may have multiple vectors due to rotation augmentation.
+    """
+    rows = conn.execute("SELECT record_id, vec FROM cover_embeddings").fetchall()
+    out: List[Tuple[int, List[List[float]]]] = []
+    for r in rows:
+        try:
+            raw = json.loads(r["vec"])
+            if not isinstance(raw, list):
+                continue
+            if raw and isinstance(raw[0], (int, float, str)):
+                vecs = [[float(x) for x in raw]]
+            else:
+                vecs = []
+                for item in raw:
+                    if isinstance(item, list):
+                        vecs.append([float(x) for x in item])
+            out.append((int(r["record_id"]), vecs))
+        except Exception:
+            continue
+    return out
 
-    url = row["cover_url"] or row["cover_url_auto"] or row["discogs_thumb"]
-    if not url:
-        conn.close()
-        raise HTTPException(404, detail="No cover URL for record")
+@app.post("/api/cover-match")
+async def api_cover_match(file: UploadFile = File(...)) -> Dict[str, Any]:
+    """
+    Accept an uploaded cover photo, compute a CLIP embedding, and find the closest
+    matching record in the existing cover_embeddings table.
 
-    try:
-        import requests
-    except Exception as e:
-        conn.close()
-        raise HTTPException(500, detail=f"'requests' not installed: {e}")
-
-    try:
-        resp = requests.get(url, headers=_discogs_headers(), timeout=REQUEST_TIMEOUT)
-        resp.raise_for_status()
-    except Exception as e:
-        conn.close()
-        raise HTTPException(502, detail=f"Error fetching cover for embedding: {e}")
-
-    emb = compute_image_embedding(resp.content)
-    vec_json = json.dumps(emb)
-
-    cur.execute(
-        """
-        INSERT INTO cover_embeddings (record_id, vec, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(record_id) DO UPDATE SET
-          vec = excluded.vec,
-          updated_at = excluded.updated_at
-        """,
-        (rid, vec_json),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True}
-
-@app.post("/api/records/cover/search")
-def search_by_cover(file: UploadFile = File(...), limit: int = Body(10, embed=True)) -> Dict[str, Any]:
-    if not CLIP_ENABLED:
-        raise HTTPException(400, detail="CLIP embedding disabled (set CLIP_ENABLED=1 to enable)")
-
-    image_bytes = file.file.read()
-    file.file.close()
+    Adds a 'confident' flag when the best match is clearly ahead of the rest:
+      - best.score >= 0.80
+      - (best.score - second_best.score) >= 0.10
+    """
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(400, detail="Empty file upload")
 
     query_vec = compute_image_embedding(image_bytes)
 
     conn = db()
+    try:
+        candidates = get_all_cover_embeddings(conn)
+        if not candidates:
+            raise HTTPException(
+                404,
+                detail="No cover embeddings present. Populate them via /api/cover-embeddings/rebuild.",
+            )
+
+        scored: List[Tuple[int, float]] = []
+        for rid, vecs in candidates:
+            if not vecs:
+                continue
+            # each record may have multiple vectors; take the best similarity
+            best_for_record = max(cosine_similarity(query_vec, v) for v in vecs)
+            scored.append((rid, best_for_record))
+
+        if not scored:
+            raise HTTPException(404, detail="No valid embeddings to compare against.")
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        best_id, best_score = scored[0]
+        second_best_score = scored[1][1] if len(scored) > 1 else 0.0
+        gap = best_score - second_best_score
+
+        # Heuristic confidence rule
+        confident = (best_score >= 0.80) and (gap >= 0.10)
+
+        top = scored[:5]
+        ids = [rid for rid, _ in top]
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, artist, title FROM records WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        meta_by_id = {int(r["id"]): r for r in rows}
+
+        candidates_out: List[Dict[str, Any]] = []
+        for rid, score in top:
+            row = meta_by_id.get(int(rid))
+            candidates_out.append(
+                {
+                    "id": int(rid),
+                    "artist": (row["artist"] if row else None),
+                    "title": (row["title"] if row else None),
+                    "score": float(score),
+                }
+            )
+
+        return {
+            "best": {
+                "id": int(best_id),
+                "score": float(best_score),
+                "gap_to_second": float(gap),
+            },
+            "candidates": candidates_out,
+            "confident": confident,
+        }
+    finally:
+        conn.close()
+
+@app.post("/api/cover-embeddings/rebuild")
+def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str, Any]:
+    """
+    Build (or refresh) cover embeddings for records that have an associated cover.
+    """
+    conn = db()
     cur = conn.cursor()
-    rows = cur.execute(
-        """
-        SELECT e.record_id, e.vec, r.artist, r.title
-        FROM cover_embeddings e
-        JOIN records r ON r.id = e.record_id
-        """
-    ).fetchall()
+    rows = cur.execute("SELECT * FROM records ORDER BY id").fetchall()
 
-    results: List[Dict[str, Any]] = []
-    for r in rows:
-        rid = r["record_id"]
-        vec = json.loads(r["vec"])
-        score = cosine_similarity(query_vec, vec)
-        results.append(
-            {
-                "record_id": rid,
-                "artist": r["artist"],
-                "title": r["title"],
-                "score": score,
-            }
-        )
+    processed = 0
+    skipped_no_image = 0
+    errors = 0
 
-    results.sort(key=lambda x: x["score"], reverse=True)
-    results = results[: max(1, min(limit, 100))]
+    for row in rows:
+        if limit is not None and processed >= limit:
+            break
 
+        rid = int(row["id"])
+        data = get_cover_bytes_for_record(row)
+        if not data:
+            skipped_no_image += 1
+            continue
+
+        try:
+            vec = compute_image_embedding(data)
+
+            vec_json = json.dumps([vec])  # store as list-of-vectors for future augmentation
+            cur.execute(
+                """
+                INSERT INTO cover_embeddings (record_id, vec, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(record_id) DO UPDATE SET
+                  vec = excluded.vec,
+                  updated_at = excluded.updated_at
+                """,
+                (rid, vec_json),
+            )
+            processed += 1
+        except HTTPException:
+            raise
+        except Exception:
+            errors += 1
+            continue
+
+    conn.commit()
     conn.close()
-    return {"results": results}
+
+    return {
+        "processed": processed,
+        "skipped_no_image": skipped_no_image,
+        "errors": errors,
+    }
