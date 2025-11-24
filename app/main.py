@@ -312,6 +312,9 @@ def create_record(payload: RecordIn = Body(...)) -> Dict[str, Any]:
     # Provide default country if blank
     if not (payload.country or "").strip():
         payload.country = "US"
+    # Provide default format if blank
+    if not (payload.format or "").strip():
+        payload.format = "LP"
     return db_insert_record(payload.dict())
 
 @app.get("/api/meta/records/schema")
@@ -410,6 +413,10 @@ def export_csv() -> Response:
 async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
     """
     Import CSV rows into the records table.
+
+    Defaults:
+      - country -> "US" if missing/blank
+      - format  -> "LP" if missing/blank
     """
 
     def to_int_or_none(v: Any) -> Optional[int]:
@@ -465,6 +472,7 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
                 val = ""
             else:
                 val = row[idx]
+
             if key == "artist":
                 rec["artist"] = nz(val)
             elif key == "title":
@@ -474,9 +482,11 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
             elif key == "label":
                 rec["label"] = nz(val)
             elif key == "format":
+                # raw value, we'll default to LP later if blank
                 rec["format"] = nz(val)
             elif key == "country":
-                rec["country"] = nz(val) or "US"
+                # raw value, we'll default to US later if blank
+                rec["country"] = nz(val)
             elif key == "catalog_number":
                 rec["catalog_number"] = nz(val)
             elif key == "barcode":
@@ -501,10 +511,14 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
         artist = nz(rec.get("artist"))
         title = nz(rec.get("title"))
         if not artist or not title:
+            # skip rows without minimum required info
             continue
 
-        if "country" not in rec or not rec["country"]:
+        # Apply defaults if missing/blank
+        if "country" not in rec or not nz(rec["country"]):
             rec["country"] = "US"
+        if "format" not in rec or not nz(rec["format"]):
+            rec["format"] = "LP"
 
         db_insert_record(rec)
         rows_imported += 1
@@ -1011,76 +1025,76 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
 
 @app.post("/api/cover-match")
 async def api_cover_match(file: UploadFile = File(...)) -> Dict[str, Any]:
-  """
-  Accept an uploaded cover photo, compute a CLIP embedding, and find the closest
-  matching record in the existing cover_embeddings table.
-  """
-  image_bytes = await file.read()
-  if not image_bytes:
-      raise HTTPException(400, detail="Empty file upload")
+    """
+    Accept an uploaded cover photo, compute a CLIP embedding, and find the closest
+    matching record in the existing cover_embeddings table.
+    """
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(400, detail="Empty file upload")
 
-  query_vec = compute_image_embedding(image_bytes)
+    query_vec = compute_image_embedding(image_bytes)
 
-  conn = db()
-  try:
-      candidates = get_all_cover_embeddings(conn)
-      if not candidates:
-          raise HTTPException(
-              404,
-              detail="No cover embeddings present. Populate them via /api/cover-embeddings/rebuild.",
-          )
+    conn = db()
+    try:
+        candidates = get_all_cover_embeddings(conn)
+        if not candidates:
+            raise HTTPException(
+                404,
+                detail="No cover embeddings present. Populate them via /api/cover-embeddings/rebuild.",
+            )
 
-      scored: List[Tuple[int, float]] = []
-      for rid, vecs in candidates:
-          if not vecs:
-              continue
-          best_for_record = max(cosine_similarity(query_vec, v) for v in vecs)
-          scored.append((rid, best_for_record))
+        scored: List[Tuple[int, float]] = []
+        for rid, vecs in candidates:
+            if not vecs:
+                continue
+            best_for_record = max(cosine_similarity(query_vec, v) for v in vecs)
+            scored.append((rid, best_for_record))
 
-      if not scored:
-          raise HTTPException(404, detail="No valid embeddings to compare against.")
+        if not scored:
+            raise HTTPException(404, detail="No valid embeddings to compare against.")
 
-      scored.sort(key=lambda x: x[1], reverse=True)
-      best_id, best_score = scored[0]
-      second_best_score = scored[1][1] if len(scored) > 1 else 0.0
-      gap = best_score - second_best_score
+        scored.sort(key=lambda x: x[1], reverse=True)
+        best_id, best_score = scored[0]
+        second_best_score = scored[1][1] if len(scored) > 1 else 0.0
+        gap = best_score - second_best_score
 
-      top = scored[:5]
-      ids = [rid for rid, _ in top]
-      placeholders = ",".join("?" for _ in ids)
-      rows = conn.execute(
-          f"SELECT id, artist, title FROM records WHERE id IN ({placeholders})",
-          ids,
-      ).fetchall()
-      meta_by_id = {int(r["id"]): r for r in rows}
+        top = scored[:5]
+        ids = [rid for rid, _ in top]
+        placeholders = ",".join("?" for _ in ids)
+        rows = conn.execute(
+            f"SELECT id, artist, title FROM records WHERE id IN ({placeholders})",
+            ids,
+        ).fetchall()
+        meta_by_id = {int(r["id"]): r for r in rows}
 
-      candidates_out: List[Dict[str, Any]] = []
-      for rid, score in top:
-          row = meta_by_id.get(int(rid))
-          candidates_out.append(
-              {
-                  "id": int(rid),
-                  "artist": (row["artist"] if row else None),
-                  "title": (row["title"] if row else None),
-                  "score": float(score),
-              }
-          )
+        candidates_out: List[Dict[str, Any]] = []
+        for rid, score in top:
+            row = meta_by_id.get(int(rid))
+            candidates_out.append(
+                {
+                    "id": int(rid),
+                    "artist": (row["artist"] if row else None),
+                    "title": (row["title"] if row else None),
+                    "score": float(score),
+                }
+            )
 
-      min_score = float(os.environ.get("COVER_MATCH_MIN_SCORE", "0.35"))
-      min_gap = float(os.environ.get("COVER_MATCH_MIN_GAP", "0.05"))
+        min_score = float(os.environ.get("COVER_MATCH_MIN_SCORE", "0.35"))
+        min_gap = float(os.environ.get("COVER_MATCH_MIN_GAP", "0.05"))
 
-      if best_score >= min_score and gap >= min_gap:
-          match_id: Optional[int] = int(best_id)
-      else:
-          match_id = None
+        if best_score >= min_score and gap >= min_gap:
+            match_id: Optional[int] = int(best_id)
+        else:
+            match_id = None
 
-      return {
-          "match": match_id,
-          "score": float(best_score),
-          "candidates": candidates_out,
-      }
-  finally:
-      conn.close()
+        return {
+            "match": match_id,
+            "score": float(best_score),
+            "candidates": candidates_out,
+        }
+    finally:
+        conn.close()
 
 @app.post("/api/cover-embeddings/rebuild")
 def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str, Any]:
