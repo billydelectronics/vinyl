@@ -27,15 +27,16 @@ app = FastAPI(title="Vinyl API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten for prod if needed
+    allow_origins=["*"],  # tighten in production if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Health
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 
 @app.get("/")
 def root() -> Dict[str, Any]:
@@ -60,6 +61,7 @@ def api_health() -> Dict[str, Any]:
 # =============================================================================
 # DB helpers
 # =============================================================================
+
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -140,21 +142,36 @@ def fetch_record(conn: sqlite3.Connection, rid: int) -> sqlite3.Row:
 
 def db_get_record_or_404(rid: int) -> Dict[str, Any]:
     conn = db()
-    row = fetch_record(conn, rid)
-    as_dict = dict(row)
-    conn.close()
-    return as_dict
+    try:
+        row = fetch_record(conn, rid)
+        return dict(row)
+    finally:
+        conn.close()
+
+
+def bump_record_updated(rid: int) -> None:
+    conn = db()
+    try:
+        conn.execute("UPDATE records SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (rid,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # =============================================================================
 # Models
 # =============================================================================
 
+
 class TrackIn(BaseModel):
     side: Optional[str] = None
     position: Optional[str] = None
     title: str
     duration: Optional[str] = None
+
+
+class TracksReplaceIn(BaseModel):
+    tracks: List[TrackIn] = Field(default_factory=list)
 
 
 class RecordIn(BaseModel):
@@ -190,6 +207,7 @@ class RecordsResponse(BaseModel):
 # =============================================================================
 # Records listing / CRUD
 # =============================================================================
+
 
 @app.get("/api/records")
 def list_records(
@@ -323,6 +341,7 @@ def bulk_delete_records(ids: List[int] = Body(...)) -> Dict[str, Any]:
 # =============================================================================
 # CSV export / import
 # =============================================================================
+
 
 @app.get("/api/meta/import-template")
 def meta_import_template() -> Response:
@@ -484,41 +503,55 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
 # Tracks
 # =============================================================================
 
+
 @app.get("/api/records/{rid}/tracks")
-def get_tracks(rid: int) -> Dict[str, Any]:
+def get_tracks(rid: int) -> List[Dict[str, Any]]:
+    """
+    Return just the list of tracks for a record (backwards compatible shape).
+    """
     conn = db()
     cur = conn.cursor()
-    row = fetch_record(conn, rid)
-    tracks = cur.execute(
-        "SELECT * FROM tracks WHERE record_id = ? ORDER BY id",
-        (row["id"],),
+    # Ensure record exists
+    _ = fetch_record(conn, rid)
+    rows = cur.execute(
+        "SELECT id, record_id, side, position, title, duration "
+        "FROM tracks WHERE record_id = ? ORDER BY id",
+        (rid,),
     ).fetchall()
     conn.close()
-    return {"record": dict(row), "tracks": [dict(t) for t in tracks]}
+    return [dict(r) for r in rows]
 
 
 @app.post("/api/records/{rid}/tracks/replace")
-def replace_tracks(rid: int, tracks: List[TrackIn] = Body(...)) -> Dict[str, Any]:
+def replace_tracks(rid: int, body: TracksReplaceIn = Body(...)) -> Dict[str, Any]:
+    """
+    Replace all tracks for a record with the provided list (body.tracks).
+    Matches the old API contract used by the frontend.
+    """
     conn = db()
     cur = conn.cursor()
-    row = fetch_record(conn, rid)
-    cur.execute("DELETE FROM tracks WHERE record_id = ?", (row["id"],))
-    for t in tracks:
+    # Ensure record exists
+    _ = fetch_record(conn, rid)
+
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
+    for t in body.tracks:
         cur.execute(
             """
             INSERT INTO tracks (record_id, side, position, title, duration)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (row["id"], t.side, t.position, t.title, t.duration),
+            (rid, t.side, t.position, t.title, t.duration),
         )
     conn.commit()
     conn.close()
-    return {"ok": True}
+    bump_record_updated(rid)
+    return {"ok": True, "count": len(body.tracks)}
 
 
 # =============================================================================
-# Discogs integration
+# Discogs integration (covers + tracks from Discogs)
 # =============================================================================
+
 
 def discogs_headers() -> Dict[str, str]:
     h = {"User-Agent": USER_AGENT}
@@ -556,13 +589,6 @@ def _nz(x: Any) -> str:
     return s
 
 
-def _fmt_tokens_from_search_item(item: Dict[str, Any]) -> List[str]:
-    fmt = item.get("format")
-    if isinstance(fmt, list):
-        return [str(x).lower() for x in fmt]
-    return []
-
-
 def _fmt_tokens_from_release_detail(detail: Dict[str, Any]) -> List[str]:
     tokens: List[str] = []
     for f in (detail.get("formats") or []):
@@ -570,19 +596,6 @@ def _fmt_tokens_from_release_detail(detail: Dict[str, Any]) -> List[str]:
         desc = [str(x).lower() for x in (f.get("descriptions") or [])]
         tokens.extend([name, *desc])
     return tokens
-
-
-def make_search_base(row: Dict[str, Any]) -> Dict[str, Any]:
-    base: Dict[str, Any] = {
-        "type": "release",
-        "format": "LP",
-        "per_page": 50,
-        "page": 1,
-    }
-    country = _nz(row.get("country"))
-    if country:
-        base["country"] = country
-    return base
 
 
 def candidate_allowed_release(detail: Dict[str, Any], required_country: Optional[str]) -> bool:
@@ -593,113 +606,6 @@ def candidate_allowed_release(detail: Dict[str, Any], required_country: Optional
         if _nz(detail.get("country")).upper() != required_country.upper():
             return False
     return True
-
-
-def candidate_allowed_search(item: Dict[str, Any], required_country: Optional[str]) -> bool:
-    if required_country and _nz(item.get("country")).upper() != required_country.upper():
-        return False
-    tokens = set(_fmt_tokens_from_search_item(item))
-    return "lp" in tokens
-
-
-def discogs_query_plan_for_row(row: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Construct search params from most precise -> least precise, all inheriting base(country, LP).
-    """
-    base = make_search_base(row)
-    artist = _nz(row.get("artist"))
-    title = _nz(row.get("title"))
-    year_str = _nz(row.get("year"))
-    year = int(year_str) if year_str.isdigit() else None
-    label = _nz(row.get("label"))
-    catno = _nz(row.get("catalog_number"))
-    barcode = _nz(row.get("barcode"))
-
-    plan: List[Dict[str, Any]] = []
-
-    # Barcode
-    if barcode:
-        p = dict(base)
-        p["barcode"] = barcode
-        if artist:
-            p["artist"] = artist
-        if title:
-            p["release_title"] = title
-        if year:
-            p["year"] = year
-        plan.append(p)
-
-    # Catalog number (+ narrowing fields)
-    if catno:
-        p = dict(base)
-        p["catno"] = catno
-        if label:
-            p["label"] = label
-        if artist:
-            p["artist"] = artist
-        if title:
-            p["release_title"] = title
-        if year:
-            p["year"] = year
-        plan.append(p)
-
-    # Structured artist/title (+ year)
-    if artist or title:
-        p = dict(base)
-        if artist:
-            p["artist"] = artist
-        if title:
-            p["release_title"] = title
-        if year:
-            p["year"] = year
-        plan.append(p)
-
-    # Loose q fallback
-    if artist or title:
-        p = dict(base)
-        p["q"] = " ".join([artist, title]).strip()
-        if year:
-            p["year"] = year
-        plan.append(p)
-
-    # Dedup
-    seen = set()
-    out: List[Dict[str, Any]] = []
-    for d in plan:
-        key = tuple(sorted(d.items()))
-        if key not in seen:
-            seen.add(key)
-            out.append(d)
-    return out
-
-
-def score_candidate_search_item(item: Dict[str, Any], row: Dict[str, Any]) -> int:
-    """
-    Simple heuristic scoring on search items.
-    """
-    score = 0
-    artist = _nz(row.get("artist")).lower()
-    title = _nz(row.get("title")).lower()
-    year = _nz(row.get("year"))
-
-    cand_artist = _nz(item.get("artist")).lower()
-    cand_title = _nz(item.get("title")).lower()
-    cand_year = _nz(item.get("year"))
-
-    if cand_artist and artist:
-        score += 25 if cand_artist == artist else (12 if artist in cand_artist else 0)
-    if cand_title and title:
-        score += 25 if cand_title == title else (12 if title in cand_title else 0)
-    if cand_year and year and cand_year == year:
-        score += 8
-
-    # Exact catno match gets a big boost
-    row_cat = _nz(row.get("catalog_number")).lower()
-    cand_cat = _nz(item.get("catno")).lower()
-    if row_cat and cand_cat and row_cat == cand_cat:
-        score += 40
-
-    return score
 
 
 def country_pref(row: Dict[str, Any]) -> Optional[str]:
@@ -728,38 +634,6 @@ def pick_best_image(detail: Dict[str, Any]) -> Tuple[Optional[str], Optional[str
     cover = chosen.get("uri")
     thumb = chosen.get("uri150") or chosen.get("resource_url")
     return cover, thumb
-
-
-@app.get("/api/records/{rid}/discogs/search")
-def api_discogs_search_for_record(
-    rid: int,
-    per_page: int = Query(20, ge=1, le=50),
-    page: int = Query(1, ge=1),
-) -> Dict[str, Any]:
-    row = db_get_record_or_404(rid)
-    required_country = country_pref(row)
-
-    out: List[Dict[str, Any]] = []
-    for params in discogs_query_plan_for_row(row):
-        js = _http_get(f"{DISCOGS_API}/database/search", params)
-        for r in js.get("results") or []:
-            if not candidate_allowed_search(r, required_country):
-                continue
-            out.append(
-                {
-                    "id": r.get("id"),
-                    "title": r.get("title"),
-                    "year": r.get("year"),
-                    "country": r.get("country"),
-                    "label": ", ".join(r.get("label") or []),
-                    "format": ", ".join(r.get("format") or []),
-                    "thumb": r.get("thumb"),
-                    "score": score_candidate_search_item(r, row),
-                }
-            )
-
-    out.sort(key=lambda x: x["score"], reverse=True)
-    return {"results": out}
 
 
 @app.get("/api/discogs/release/{release_id}")
@@ -803,30 +677,61 @@ def fetch_cover_for_record(rid: int, release_id: int = Body(..., embed=True)) ->
     return db_get_record_or_404(rid)
 
 
+def discogs_fetch_tracklist_for_release(
+    release_id: int, detail: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Accepts optional pre-fetched release detail to avoid a second HTTP call.
+    """
+    rel = detail or discogs_release_details(release_id)
+    out: List[Dict[str, Any]] = []
+    for t in rel.get("tracklist", []) or []:
+        pos = (t.get("position") or "").strip()
+        title = (t.get("title") or "").strip()
+        duration = (t.get("duration") or "").strip()
+        side = "A"
+        if pos and pos[0].isalpha():
+            side = pos[0].upper()
+        out.append({"position": pos, "title": title, "duration": duration, "side": side})
+    return out
+
+
 @app.post("/api/records/{rid}/tracks/save")
-def save_tracks_for_record(rid: int, release_id: int = Body(..., embed=True)) -> Dict[str, Any]:
+def save_tracks_for_record(
+    rid: int,
+    release_id: int = Body(..., embed=True),
+) -> Dict[str, Any]:
+    """
+    Import tracks from a Discogs release id and replace existing tracks.
+    (Frontend passes the chosen release_id explicitly.)
+    """
     detail = discogs_release_details(release_id)
+    row = db_get_record_or_404(rid)
+    if not candidate_allowed_release(detail, country_pref(row)):
+        raise HTTPException(400, detail="Chosen release does not satisfy LP + country constraint")
+
     tracks = discogs_fetch_tracklist_for_release(release_id, detail)
 
     conn = db()
     cur = conn.cursor()
-    row = fetch_record(conn, rid)
-    cur.execute("DELETE FROM tracks WHERE record_id = ?", (row["id"],))
+    cur.execute("DELETE FROM tracks WHERE record_id = ?", (rid,))
     for t in tracks:
         cur.execute(
             """
             INSERT INTO tracks (record_id, side, position, title, duration)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (row["id"], t["side"], t["position"], t["title"], t["duration"]),
+            (rid, t["side"], t["position"], t["title"], t["duration"]),
         )
     conn.commit()
     conn.close()
-    return {"ok": True, "tracks": tracks}
+
+    bump_record_updated(rid)
+    return {"ok": True, "count": len(tracks)}
 
 
 # =============================================================================
-# Cover image embeddings & matching (CLIP-based)
+# Cover image embeddings & matching (CLIP-based, with rotations)
 # =============================================================================
 
 _CLIP_MODEL = None
@@ -891,27 +796,83 @@ def compute_image_embedding(image_bytes: bytes) -> List[float]:
     return vec
 
 
-def save_cover_embedding(conn: sqlite3.Connection, record_id: int, vec: List[float]) -> None:
+def compute_cover_embeddings_with_rotations(image_bytes: bytes) -> List[List[float]]:
     """
-    Persist a cover embedding vector for a record into the cover_embeddings table.
+    For cover images, compute multiple embeddings:
+    - Original
+    - Rotated slightly (e.g., -5°, +5°)
+
+    This makes matching more robust to tilted phone photos.
+    """
+    try:
+        from PIL import Image  # type: ignore
+        import torch           # type: ignore
+    except Exception as e:
+        raise HTTPException(500, detail=f"Image/torch dependencies not available: {e}")
+
+    from io import BytesIO
+
+    model, preprocess, device = get_clip_model()
+
+    try:
+        base_img = Image.open(BytesIO(image_bytes)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(400, detail=f"Could not decode image: {e}")
+
+    angles = [0, -5, 5]  # degrees
+    vecs: List[List[float]] = []
+
+    with torch.no_grad():
+        for ang in angles:
+            if ang == 0:
+                img = base_img
+            else:
+                img = base_img.rotate(ang, resample=Image.BICUBIC, expand=True)
+            image_tensor = preprocess(img).unsqueeze(0).to(device)
+            features = model.encode_image(image_tensor)
+            features = features / features.norm(dim=-1, keepdim=True)
+            v: List[float] = features[0].cpu().tolist()
+            vecs.append(v)
+
+    return vecs
+
+
+def save_cover_embedding(conn: sqlite3.Connection, record_id: int, vecs: List[List[float]]) -> None:
+    """
+    Persist one or more cover embedding vectors for a record into the cover_embeddings table.
+    Stored as JSON list-of-lists. For older data that had a single vector, we treat that
+    as a single-element list at read time.
     """
     conn.execute(
         "INSERT OR REPLACE INTO cover_embeddings(record_id, vec, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-        (record_id, json.dumps(vec)),
+        (record_id, json.dumps(vecs)),
     )
 
 
-def get_all_cover_embeddings(conn: sqlite3.Connection) -> List[Tuple[int, List[float]]]:
+def get_all_cover_embeddings(conn: sqlite3.Connection) -> List[Tuple[int, List[List[float]]]]:
     """
-    Return all stored cover embeddings as (record_id, vector) pairs.
+    Return all stored cover embeddings as (record_id, [vectors...]) pairs.
+    Each record may have multiple vectors due to rotation augmentation.
     """
     rows = conn.execute("SELECT record_id, vec FROM cover_embeddings").fetchall()
-    out: List[Tuple[int, List[float]]] = []
+    out: List[Tuple[int, List[List[float]]]] = []
     for r in rows:
         try:
-            vec = json.loads(r["vec"])
-            if isinstance(vec, list):
-                out.append((int(r["record_id"]), [float(x) for x in vec]))
+            raw = json.loads(r["vec"])
+            if not isinstance(raw, list):
+                continue
+            # raw might be a single vector [float,...] or list-of-vectors
+            if raw and isinstance(raw[0], (int, float, str)):
+                # Treat as single embedding
+                vecs = [[float(x) for x in raw]]
+            else:
+                # list-of-lists
+                vecs = []
+                for v in raw:
+                    if isinstance(v, list):
+                        vecs.append([float(x) for x in v])
+            if vecs:
+                out.append((int(r["record_id"]), vecs))
         except Exception:
             continue
     return out
@@ -993,6 +954,7 @@ async def api_cover_match(file: UploadFile = File(...)) -> Dict[str, Any]:
     if not image_bytes:
         raise HTTPException(400, detail="Empty file upload")
 
+    # Single embedding for the query image; record embeddings are multi-vec.
     query_vec = compute_image_embedding(image_bytes)
 
     conn = db()
@@ -1005,9 +967,15 @@ async def api_cover_match(file: UploadFile = File(...)) -> Dict[str, Any]:
             )
 
         scored: List[Tuple[int, float]] = []
-        for rid, vec in candidates:
-            score = cosine_similarity(query_vec, vec)
-            scored.append((rid, score))
+        for rid, vecs in candidates:
+            if not vecs:
+                continue
+            # Max similarity across all rotation-augmented embeddings for this record
+            best_for_record = max(cosine_similarity(query_vec, v) for v in vecs)
+            scored.append((rid, best_for_record))
+
+        if not scored:
+            raise HTTPException(404, detail="No valid embeddings to compare against.")
 
         scored.sort(key=lambda x: x[1], reverse=True)
         best_id, best_score = scored[0]
@@ -1081,8 +1049,9 @@ def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str
                 skipped_no_image += 1
                 continue
 
-            vec = compute_image_embedding(img_bytes)
-            save_cover_embedding(conn, rid, vec)
+            # Multiple rotation-augmented embeddings per record
+            vecs = compute_cover_embeddings_with_rotations(img_bytes)
+            save_cover_embedding(conn, rid, vecs)
             processed += 1
         except HTTPException:
             raise
@@ -1098,26 +1067,3 @@ def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str
         "skipped_no_image": skipped_no_image,
         "errors": errors,
     }
-
-
-# =============================================================================
-# Tracklist extraction (reused)
-# =============================================================================
-
-def discogs_fetch_tracklist_for_release(
-    release_id: int, detail: Optional[Dict[str, Any]] = None
-) -> List[Dict[str, Any]]:
-    """
-    Accepts optional pre-fetched release detail to avoid a second HTTP call.
-    """
-    rel = detail or discogs_release_details(release_id)
-    out: List[Dict[str, Any]] = []
-    for t in rel.get("tracklist", []) or []:
-        pos = (t.get("position") or "").strip()
-        title = (t.get("title") or "").strip()
-        duration = (t.get("duration") or "").strip()
-        side = "A"
-        if pos and pos[0].isalpha():
-            side = pos[0].upper()
-        out.append({"position": pos, "title": title, "duration": duration, "side": side})
-    return out

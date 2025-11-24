@@ -36,7 +36,66 @@
     }
   }
 
-  function onFileChange(event: Event) {
+  /**
+   * Crop an image file to a centered square on the client.
+   * If anything fails, fall back to the original file.
+   */
+  function cropToSquare(file: File): Promise<File> {
+    return new Promise((resolve) => {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+
+      img.onload = () => {
+        try {
+          const size = Math.min(img.width, img.height);
+          const sx = (img.width - size) / 2;
+          const sy = (img.height - size) / 2;
+
+          const canvas = document.createElement('canvas');
+          canvas.width = size;
+          canvas.height = size;
+          const ctx = canvas.getContext('2d');
+
+          if (!ctx) {
+            URL.revokeObjectURL(url);
+            resolve(file);
+            return;
+          }
+
+          ctx.drawImage(img, sx, sy, size, size, 0, 0, size, size);
+
+          const mimeType = file.type && file.type.startsWith('image/') ? file.type : 'image/jpeg';
+          canvas.toBlob(
+            (blob) => {
+              URL.revokeObjectURL(url);
+              if (!blob) {
+                resolve(file);
+                return;
+              }
+              const cropped = new File([blob], file.name, { type: mimeType });
+              resolve(cropped);
+            },
+            mimeType,
+            0.9
+          );
+        } catch (e) {
+          console.error('cropToSquare failed, using original file', e);
+          URL.revokeObjectURL(url);
+          resolve(file);
+        }
+      };
+
+      img.onerror = () => {
+        console.error('Image load error in cropToSquare');
+        URL.revokeObjectURL(url);
+        resolve(file);
+      };
+
+      img.src = url;
+    });
+  }
+
+  async function onFileChange(event: Event) {
     resetState();
 
     const input = event.currentTarget as HTMLInputElement;
@@ -45,16 +104,20 @@
       return;
     }
 
-    const file = files[0];
-    imageFile = file;
-    imagePreviewUrl = URL.createObjectURL(file);
+    const originalFile = files[0];
+
+    // Crop to centered square before upload / preview
+    const croppedFile = await cropToSquare(originalFile);
+
+    imageFile = croppedFile;
+    imagePreviewUrl = URL.createObjectURL(croppedFile);
 
     void submitImage();
   }
 
   async function submitImage() {
     if (!imageFile) {
-      errorMsg = 'Please select or capture a cover image first.';
+      errorMsg = 'Please capture or select a cover image first.';
       return;
     }
 
@@ -127,8 +190,9 @@
 <h2 class="text-xl font-semibold mb-3">Scan album cover</h2>
 
 <p class="text-sm text-muted-foreground mb-4">
-  Use your iPhone camera to capture the front cover of a record. For best results, fill the screen
-  with the cover and hold the phone as straight-on as possible.
+  Use your iPhone camera to capture the front cover of a record. For best results, fill the camera
+  view with the cover and keep it as straight-on as possible. The image is cropped to a centered
+  square before matching.
 </p>
 
 <div class="mb-4">
@@ -151,9 +215,13 @@
 
 {#if imagePreviewUrl}
   <div class="mb-4">
-    <p class="text-xs text-muted-foreground mb-1">Preview</p>
+    <p class="text-xs text-muted-foreground mb-1">Preview (cropped to square)</p>
     <div class="max-w-xs border border-border rounded-lg overflow-hidden bg-black">
-      <img src={imagePreviewUrl} alt="Selected album cover preview" class="w-full object-contain" />
+      <img
+        src={imagePreviewUrl}
+        alt="Selected album cover preview"
+        class="w-full object-contain"
+      />
     </div>
   </div>
 {/if}
