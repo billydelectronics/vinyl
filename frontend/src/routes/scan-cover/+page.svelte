@@ -22,13 +22,13 @@
     gap_to_second: number;
   };
 
-  // Supports both the old { match, score, candidates }
-  // and new { best, candidates, confident } shapes.
+  // Support both legacy and newer response shapes
   type MatchResponse = {
     // legacy shape
     match?: number | null;
     score?: number | null;
-    // new shape
+
+    // newer shape
     best?: BestMatch | null;
     confident?: boolean;
     candidates?: Candidate[];
@@ -160,7 +160,7 @@
       const data = (await res.json()) as MatchResponse;
       lastResponse = data;
 
-      // --- 1) Legacy shape: { match, score } --------------------------------
+      // 1) Legacy behavior: backend sets "match" id when confident
       if (data.match != null) {
         infoMsg = 'High confidence match. Opening record…';
         setTimeout(() => {
@@ -169,38 +169,30 @@
         return;
       }
 
-      // --- 2) New shape: { best, candidates, confident } ---------------------
-      const best = data.best ?? null;
+      // 2) Normalize candidates and always auto-open top one if any exist
+      const candidates: Candidate[] = (data.candidates ?? []).slice();
 
-      // Decide if it's a confident match:
-      //   - use 'confident' if backend provided it
-      //   - else fallback to score >= 0.80 and gap >= 0.10
-      let confident = false;
-      if (typeof data.confident === 'boolean') {
-        confident = data.confident;
-      } else if (best) {
-        const score = best.score ?? 0;
-        const gap = best.gap_to_second ?? 0;
-        confident = score >= 0.8 && gap >= 0.1;
+      if (candidates.length > 0) {
+        // Sort by score descending (treat null/undefined as 0)
+        const sorted = candidates
+          .slice()
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+
+        const top = sorted[0];
+
+        if (top) {
+          infoMsg = 'Opening best match…';
+          setTimeout(() => {
+            goto(`/read/${top.id}`);
+          }, 250);
+          return;
+        }
       }
 
-      if (best && confident) {
-        infoMsg = 'High confidence match. Opening record…';
-        setTimeout(() => {
-          goto(`/read/${best.id}`);
-        }, 250);
-        return;
-      }
-
-      // --- 3) Not confident: show candidates / messages ----------------------
+      // 3) No candidates at all → show guidance
       infoMsg = '';
-      if (data.candidates && data.candidates.length > 0) {
-        errorMsg =
-          'No confident single match. Tap the correct album below or try another photo.';
-      } else {
-        errorMsg =
-          'No matching record found for this cover. Try a clearer, front-on photo filling the frame.';
-      }
+      errorMsg =
+        'No matching record found for this cover. Try a clearer, front-on photo filling the frame.';
     } catch (err: unknown) {
       console.error(err);
       errorMsg =
