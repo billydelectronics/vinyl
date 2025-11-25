@@ -3,8 +3,9 @@
 # run-website.sh
 #
 # Usage:
-#   ./run-website.sh docker   # full site via Docker (vinyl.local)
-#   ./run-website.sh local    # full site via local backend + frontend dev
+#   ./run-website.sh docker      # full site via Docker (vinyl.local)
+#   ./run-website.sh local       # local backend + frontend dev (slow, reload)
+#   ./run-website.sh local-prod  # local backend (fast) + built frontend (fast)
 #
 # Defaults to 'docker' if no argument is provided.
 
@@ -26,7 +27,6 @@ start_docker_site() {
     exit 1
   fi
 
-  # Build & start app + frontend + caddy
   ./deploy.sh all
 
   echo
@@ -41,34 +41,32 @@ stop_docker_stack_if_running() {
   fi
 }
 
+# ------------------------------------------------------------------------------
+# LOCAL (DEV MODE)
+# ------------------------------------------------------------------------------
 start_local_site() {
-  echo "Bringing up Vinyl Record Tracker in LOCAL mode…"
-  echo "  - Backend: uvicorn (FastAPI) on 127.0.0.1:8000"
-  echo "  - Frontend: Vite dev server on localhost:5173"
+  echo "Bringing up Vinyl Record Tracker in LOCAL DEV mode…"
+  echo "  - Backend: uvicorn --reload (slow)"
+  echo "  - Frontend: Vite dev server (slow)"
 
-  # 1) Stop Docker stack so it doesn't conflict
   stop_docker_stack_if_running
 
-  # 2) Check venv
   if [ ! -d "$VENV_PATH" ]; then
     echo "ERROR: Virtualenv '$VENV_PATH' not found."
     echo "Create it with:  cd \"$ROOT\" && python3.11 -m venv .venv311"
     exit 1
   fi
 
-  # 3) Start backend (uvicorn) in the background
-  # Use the SAME DB as Docker: ./data/records.db -> /app/data/records.db in container
   export VINYL_DB="$ROOT/data/records.db"
-  echo "Using database at: $VINYL_DB"
-
-  # Make sure the folder exists
+  export CLIP_MODEL_NAME="ViT-L/14@336px"
+  export USER_AGENT="VinylRecordTracker/1.0"
+  export REQUEST_TIMEOUT="20"
   mkdir -p "$ROOT/data"
 
-  echo "Starting local backend (uvicorn)…"
+  echo "Starting local backend (uvicorn --reload)…"
 
   (
     cd "$ROOT/app"
-    # shellcheck source=/dev/null
     source "$VENV_PATH/bin/activate"
     uvicorn main:app --reload
   ) > "$ROOT/backend-local.log" 2>&1 &
@@ -76,7 +74,6 @@ start_local_site() {
   BACKEND_PID=$!
   echo "Backend PID: $BACKEND_PID (logs: backend-local.log)"
 
-  # Ensure we stop backend when this script is interrupted or exits
   cleanup() {
     echo
     echo "Stopping local backend (PID $BACKEND_PID)…"
@@ -84,22 +81,86 @@ start_local_site() {
   }
   trap cleanup INT TERM EXIT
 
-  # 4) Start frontend dev server (foreground)
   cd "$ROOT/frontend"
 
   if [ ! -d "node_modules" ]; then
-    echo "node_modules not found. Running npm install (first time setup)…"
+    echo "node_modules not found. Running npm install…"
     npm install
   fi
 
   echo
-  echo "Starting frontend dev server…"
-  echo "When it says 'Local: http://localhost:5173/', open that in your browser."
+  echo "Starting Vite dev server…"
+  echo "Open: http://localhost:5173/"
   echo
 
   npm run dev -- --host 0.0.0.0
 }
 
+# ------------------------------------------------------------------------------
+# LOCAL-PROD (FAST MODE)
+# ------------------------------------------------------------------------------
+start_local_prod_site() {
+  echo "Bringing up Vinyl Record Tracker in LOCAL-PROD mode…"
+  echo "  - Backend: uvicorn (no reload, fast)"
+  echo "  - Frontend: built + preview (fast, like Docker)"
+
+  stop_docker_stack_if_running
+
+  if [ ! -d "$VENV_PATH" ]; then
+    echo "ERROR: Virtualenv '$VENV_PATH' not found."
+    echo "Create it with:  cd \"$ROOT\" && python3.11 -m venv .venv311"
+    exit 1
+  fi
+
+  export VINYL_DB="$ROOT/data/records.db"
+  # export CLIP_MODEL_NAME="ViT-L/14@336px"
+  export CLIP_MODEL_NAME="ViT-B/32"
+  # Force MPS in case torch ever defaults to CPU
+  export CLIP_DEVICE="mps"
+  export USER_AGENT="VinylRecordTracker/1.0"
+  export REQUEST_TIMEOUT="20"
+  mkdir -p "$ROOT/data"
+
+  echo "Starting local backend (uvicorn, NO reload)…"
+
+  (
+    cd "$ROOT/app"
+    source "$VENV_PATH/bin/activate"
+    uvicorn main:app --host 0.0.0.0 --port 8000
+  ) > "$ROOT/backend-local.log" 2>&1 &
+
+  BACKEND_PID=$!
+  echo "Backend PID: $BACKEND_PID (logs: backend-local.log)"
+
+  cleanup() {
+    echo
+    echo "Stopping local backend (PID $BACKEND_PID)…"
+    kill "$BACKEND_PID" 2>/dev/null || true
+  }
+  trap cleanup INT TERM EXIT
+
+  cd "$ROOT/frontend"
+
+  if [ ! -d "node_modules" ]; then
+    echo "node_modules not found. Running npm install…"
+    npm install
+  fi
+
+  echo
+  echo "Building frontend (npm run build)…"
+  npm run build
+
+  echo
+  echo "Starting frontend preview server (fast)…"
+  echo "Open: http://localhost:5173/"
+  echo
+
+  npm run preview -- --host 0.0.0.0 --port 5173
+}
+
+# ------------------------------------------------------------------------------
+# MODE HANDLER
+# ------------------------------------------------------------------------------
 case "$MODE" in
   docker)
     start_docker_site
@@ -107,9 +168,12 @@ case "$MODE" in
   local)
     start_local_site
     ;;
+  local-prod)
+    start_local_prod_site
+    ;;
   *)
     echo "Unknown mode: $MODE"
-    echo "Usage: $0 [docker|local]"
+    echo "Usage: $0 [docker|local|local-prod]"
     exit 1
     ;;
 esac
