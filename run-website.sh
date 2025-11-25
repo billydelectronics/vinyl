@@ -113,8 +113,8 @@ start_local_prod_site() {
   fi
 
   export VINYL_DB="$ROOT/data/records.db"
-  # export CLIP_MODEL_NAME="ViT-L/14@336px"
-  export CLIP_MODEL_NAME="ViT-B/32"
+  export CLIP_MODEL_NAME="ViT-L/14@336px"
+  # export CLIP_MODEL_NAME="ViT-B/32"
   # Force MPS in case torch ever defaults to CPU
   export CLIP_DEVICE="mps"
   export USER_AGENT="VinylRecordTracker/1.0"
