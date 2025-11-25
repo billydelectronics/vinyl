@@ -14,7 +14,13 @@ from pydantic import BaseModel, Field
 # Config
 # =============================================================================
 
-DB_PATH = os.environ.get("VINYL_DB", "/app/data/records.db")
+# DB_PATH = os.environ.get("VINYL_DB", "/app/data/records.db")
+
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_DB_PATH = PROJECT_ROOT / "data" / "records.db"
+DB_PATH = os.environ.get("VINYL_DB", str(DEFAULT_DB_PATH))
 
 DISCOGS_API = "https://api.discogs.com"
 DISCOGS_TOKEN = os.environ.get("DISCOGS_TOKEN")  # optional
