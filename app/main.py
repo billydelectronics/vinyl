@@ -99,6 +99,7 @@ def init_db() -> None:
           label TEXT,
           format TEXT,
           country TEXT,
+          location TEXT,
           catalog_number TEXT,
           barcode TEXT,
           discogs_id INTEGER,
@@ -267,6 +268,7 @@ class RecordIn(BaseModel):
     label: Optional[str] = None
     format: Optional[str] = None
     country: Optional[str] = None
+    location: Optional[str] = None
     catalog_number: Optional[str] = None
     barcode: Optional[str] = None
     discogs_id: Optional[int] = None
@@ -286,6 +288,7 @@ class RecordPatch(BaseModel):
     label: Optional[str] = None
     format: Optional[str] = None
     country: Optional[str] = None
+    location: Optional[str] = None
     catalog_number: Optional[str] = None
     barcode: Optional[str] = None
     discogs_id: Optional[int] = None
@@ -375,15 +378,15 @@ def list_records(
     if search:
         like = like_pattern(search)
         where_clauses.append(
-            "(artist LIKE ? OR title LIKE ? OR label LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)"
+            "(artist LIKE ? OR title LIKE ? OR label LIKE ? OR country LIKE ? OR location LIKE ? OR catalog_number LIKE ? OR barcode LIKE ?)"
         )
-        params.extend([like, like, like, like, like])
+        params.extend([like, like, like, like, like, like, like])
 
     where_sql = ""
     if where_clauses:
         where_sql = "WHERE " + " AND ".join(where_clauses)
 
-    allowed_sort = {"artist", "title", "year", "label", "country", "created_at", "updated_at"}
+    allowed_sort = {"artist", "title", "year", "label", "country", "location", "created_at", "updated_at"}
     if sort_key not in allowed_sort:
         sort_key = "artist"
     sort_dir = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
@@ -489,6 +492,7 @@ def meta_import_template() -> Response:
         "label",
         "format",
         "country",
+        "location",
         "catalog_number",
         "barcode",
         "discogs_id",
@@ -527,6 +531,7 @@ def export_records() -> Response:
         "label",
         "format",
         "country",
+        "location",
         "catalog_number",
         "barcode",
         "discogs_id",
@@ -628,6 +633,8 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
                 rec["format"] = nz(val)
             elif key == "country":
                 rec["country"] = nz(val)
+            elif key == "location":
+                rec["location"] = nz(val)
             elif key == "catalog_number":
                 rec["catalog_number"] = nz(val)
             elif key == "barcode":
@@ -1343,6 +1350,7 @@ def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str
         "errors": errors,
     }
 
+
 @app.post("/api/cover-embeddings/build-missing")
 def api_build_missing_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str, Any]:
     """
@@ -1369,7 +1377,7 @@ def api_build_missing_cover_embeddings(limit: Optional[int] = Query(None)) -> Di
     errors = 0
 
     for row in rows:
-      # respect optional ?limit= query param, same as rebuild endpoint
+        # respect optional ?limit= query param, same as rebuild endpoint
         if limit is not None and processed >= limit:
             break
 
