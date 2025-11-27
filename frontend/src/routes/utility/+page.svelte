@@ -57,7 +57,12 @@
     return 0;
   }
 
-  function filtered(records: RecordRow[], q: string, key: 'title' | 'artist' | 'year', dir: 'asc' | 'desc'): RecordRow[] {
+  function filtered(
+    records: RecordRow[],
+    q: string,
+    key: 'title' | 'artist' | 'year',
+    dir: 'asc' | 'desc'
+  ): RecordRow[] {
     const query = q.trim().toLowerCase();
 
     let rows = records.filter((r) => {
@@ -105,7 +110,9 @@
         } catch {
           // ignore
         }
-        throw new Error(`HTTP ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`);
+        throw new Error(
+          `HTTP ${res.status} ${res.statusText}${body ? ` — ${body.slice(0, 200)}` : ''}`
+        );
       }
 
       const json = (await res.json()) as any;
@@ -125,7 +132,10 @@
 
       allRecords = (arr as unknown[]).map((r) => r as RecordRow);
     } catch (e: any) {
-      err = e?.name === 'AbortError' ? 'Request timed out after 8s.' : e?.message ?? 'Failed to load records';
+      err =
+        e?.name === 'AbortError'
+          ? 'Request timed out after 8s.'
+          : e?.message ?? 'Failed to load records';
     } finally {
       clearTimeout(timeout);
       loading = false;
@@ -233,7 +243,10 @@
       const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      const defaultName = `records_full_export_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.csv`;
+      const defaultName = `records_full_export_${new Date()
+        .toISOString()
+        .slice(0, 19)
+        .replace(/[:T]/g, '-')}.csv`;
       a.href = url;
       a.download = defaultName;
       document.body.appendChild(a);
@@ -244,6 +257,100 @@
       alert(e?.message ?? 'Export failed.');
     } finally {
       exportBusy = false;
+    }
+  }
+
+  // ---------- Cover embedding tools ----------
+  let coverRebuildBusy = false;
+  let coverMissingBusy = false;
+
+  const COVER_REBUILD_URL = '/api/cover-embeddings/rebuild';
+  const COVER_BUILD_MISSING_URL = '/api/cover-embeddings/build-missing';
+
+  async function rebuildAllCoverEmbeddings() {
+    if (!confirm('Rebuild cover embeddings for ALL records? This may take a while.')) return;
+
+    coverRebuildBusy = true;
+    try {
+      const res = await fetch(COVER_REBUILD_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} — ${text.slice(0, 200)}`);
+      }
+
+      // Attempt to parse JSON
+      let data: any = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        // If parsing fails, fall back to raw text
+        alert(`Rebuild complete.\n\nRaw response:\n${text}`);
+        return;
+      }
+
+      // Expected shape: { processed: N, skipped_no_image: M, errors: X }
+      const { processed, skipped_no_image, errors } = data;
+
+      alert(
+        `Rebuild complete:\n\n` +
+          `Processed: ${processed}\n` +
+          `Skipped (no image): ${skipped_no_image}\n` +
+          `Errors: ${errors}`
+      );
+    } catch (e: any) {
+      alert(e?.message ?? 'Failed to rebuild cover embeddings.');
+    } finally {
+      coverRebuildBusy = false;
+    }
+  }
+
+  async function buildMissingCoverEmbeddings() {
+    if (!confirm('Build cover embeddings only for records that are missing them?')) return;
+
+    coverMissingBusy = true;
+    try {
+      const res = await fetch(COVER_BUILD_MISSING_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}'
+      });
+
+      const text = await res.text();
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} — ${text.slice(0, 200)}`);
+      }
+
+      // Try parsing JSON
+      let data: any = null;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        alert(`Build complete.\n\nRaw response:\n${text}`);
+        return;
+      }
+
+      // Expected structure: { processed, skipped_no_image, errors }
+      const { processed, skipped_no_image, errors } = data;
+
+      alert(
+        `Build missing cover embeddings complete:\n\n` +
+          `Processed: ${processed}\n` +
+          `Skipped (no image): ${skipped_no_image}\n` +
+          `Errors: ${errors}`
+      );
+    } catch (e: any) {
+      alert(e?.message ?? 'Failed to build missing cover embeddings.');
+    } finally {
+      coverMissingBusy = false;
     }
   }
 
@@ -290,6 +397,23 @@
           on:click={exportCsv}
         >
           {exportBusy ? 'Exporting…' : 'Export CSV'}
+        </button>
+
+        <!-- Embedding tools in nav bar -->
+        <button
+          class="px-3 py-1.5 rounded-lg border border-indigo-400/60 bg-indigo-500/10 text-indigo-100 hover:bg-indigo-500/20 disabled:opacity-50 text-sm"
+          on:click={rebuildAllCoverEmbeddings}
+          disabled={coverRebuildBusy || coverMissingBusy}
+        >
+          {coverRebuildBusy ? 'Rebuilding…' : 'Rebuild All'}
+        </button>
+
+        <button
+          class="px-3 py-1.5 rounded-lg border border-sky-400/60 bg-sky-500/10 text-sky-100 hover:bg-sky-500/20 disabled:opacity-50 text-sm"
+          on:click={buildMissingCoverEmbeddings}
+          disabled={coverRebuildBusy || coverMissingBusy}
+        >
+          {coverMissingBusy ? 'Building…' : 'Build Missing'}
         </button>
       </div>
     </div>
@@ -375,7 +499,9 @@
             </tr>
           {:else if rows.length === 0}
             <tr>
-              <td class="p-6 text-center text-gray-400" colspan="6">No records match your search.</td>
+              <td class="p-6 text-center text-gray-400" colspan="6">
+                No records match your search.
+              </td>
             </tr>
           {:else}
             {#each rows as r}
@@ -401,7 +527,9 @@
                       />
                     </a>
                   {:else}
-                    <div class="w-10 h-10 flex items-center justify-center rounded-md border border-dashed border-gray-700 text-xs text-gray-500">
+                    <div
+                      class="w-10 h-10 flex items-center justify-center rounded-md border border-dashed border-gray-700 text-xs text-gray-500"
+                    >
                       No cover
                     </div>
                   {/if}

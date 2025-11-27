@@ -1342,3 +1342,70 @@ def api_rebuild_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str
         "skipped_no_image": skipped_no_image,
         "errors": errors,
     }
+
+@app.post("/api/cover-embeddings/build-missing")
+def api_build_missing_cover_embeddings(limit: Optional[int] = Query(None)) -> Dict[str, Any]:
+    """
+    Build cover embeddings **only** for records that don't already have an entry
+    in the cover_embeddings table.
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    # Only select records that currently have NO embedding row
+    rows = cur.execute(
+        """
+        SELECT r.*
+        FROM records AS r
+        LEFT JOIN cover_embeddings AS ce
+          ON ce.record_id = r.id
+        WHERE ce.record_id IS NULL
+        ORDER BY r.id
+        """
+    ).fetchall()
+
+    processed = 0
+    skipped_no_image = 0
+    errors = 0
+
+    for row in rows:
+      # respect optional ?limit= query param, same as rebuild endpoint
+        if limit is not None and processed >= limit:
+            break
+
+        rid = int(row["id"])
+        data = get_cover_bytes_for_record(row)
+        if not data:
+            skipped_no_image += 1
+            continue
+
+        try:
+            vec = compute_image_embedding(data)
+
+            vec_json = json.dumps([vec])  # store as list-of-vectors for future augmentation
+            cur.execute(
+                """
+                INSERT INTO cover_embeddings (record_id, vec, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(record_id) DO UPDATE SET
+                  vec = excluded.vec,
+                  updated_at = excluded.updated_at
+                """,
+                (rid, vec_json),
+            )
+            processed += 1
+        except HTTPException:
+            # preserve the original behavior and let FastAPI handle this
+            raise
+        except Exception:
+            errors += 1
+            continue
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "processed": processed,
+        "skipped_no_image": skipped_no_image,
+        "errors": errors,
+    }
