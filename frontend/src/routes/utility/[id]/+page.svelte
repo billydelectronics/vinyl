@@ -39,6 +39,7 @@
   // ---- State ----
   let loading = false;
   let saving = false;
+  let fetchingCover = false; // NEW: specifically tracks best-match cover fetch
 
   let rec: RecordRow | null = null;    // server truth
   let draft: RecordRow | null = null;  // editable copy
@@ -182,6 +183,7 @@
   // ---- Cover: best match ----
   async function fetchBestMatch() {
     saving = true;
+    fetchingCover = true;
     try {
       const r1 = await fetch(`/api/records/${rid}/cover/fetch`, { method: 'POST' });
       if (!r1.ok) throw new Error(`Cover fetch failed (${r1.status})`);
@@ -190,6 +192,7 @@
     } catch (e: any) {
       alert(e?.message ?? 'Cover fetch failed');
     } finally {
+      fetchingCover = false;
       saving = false;
     }
   }
@@ -350,9 +353,17 @@
           </div>
 
           <div class="grid grid-cols-1 gap-2">
-            <button type="button" class="w-full px-3 py-2 rounded-md bg-gray-800 hover:bg-gray-700 border border-gray-700"
-                    on:click={fetchBestMatch} disabled={saving}>
-              Fetch cover (best match)
+            <button
+              type="button"
+              class="w-full px-3 py-2 rounded-md bg-gray-800 hover:bg-gray-700 border border-gray-700"
+              on:click={fetchBestMatch}
+              disabled={saving}
+            >
+              {#if fetchingCover}
+                Fetching cover...
+              {:else}
+                Fetch cover (best match)
+              {/if}
             </button>
             <button type="button" class="w-full px-3 py-2 rounded-md bg-gray-900 hover:bg-gray-800 border border-gray-700"
                     on:click={openPicker} disabled={saving}>
