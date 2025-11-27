@@ -35,6 +35,10 @@
   let loading = false;
   let err = '';
 
+  // Note toggle state (default collapsed)
+  let albumNotesOpen = false;
+  let personalNotesOpen = false;
+
   function coverUrl(r: RecordRow | null): string | null {
     if (!r) return null;
     return r.cover_url || r.cover_local || r.cover_url_auto || r.discogs_thumb || null;
@@ -47,6 +51,10 @@
       const r = await fetch(`/api/records/${id}`);
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       record = (await r.json()) as RecordRow;
+
+      // Reset note toggles when a record is loaded
+      albumNotesOpen = false;
+      personalNotesOpen = false;
     } catch (e: any) {
       err = e?.message || 'Failed to load record';
     } finally {
@@ -131,19 +139,43 @@
       <section class="space-y-4">
         {#if hasAlbumNotes(record)}
           <div>
-            <div class="text-sm font-medium mb-1">Album Notes</div>
-            <div class="whitespace-pre-wrap text-sm rounded-md border border-zinc-800 bg-zinc-950 p-3">
-              {record.album_notes}
-            </div>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between text-sm font-medium mb-1 cursor-pointer select-none"
+              on:click={() => (albumNotesOpen = !albumNotesOpen)}
+            >
+              <span>Album Notes</span>
+              <span class="text-xs text-zinc-400">
+                {albumNotesOpen ? 'Hide' : 'Show'}
+              </span>
+            </button>
+
+            {#if albumNotesOpen}
+              <div class="whitespace-pre-wrap text-sm rounded-md border border-zinc-800 bg-zinc-950 p-3">
+                {record.album_notes}
+              </div>
+            {/if}
           </div>
         {/if}
 
         {#if hasPersonalNotes(record)}
           <div>
-            <div class="text-sm font-medium mb-1">Personal Notes</div>
-            <div class="whitespace-pre-wrap text-sm rounded-md border border-zinc-800 bg-zinc-950 p-3">
-              {record.personal_notes}
-            </div>
+            <button
+              type="button"
+              class="flex w-full items-center justify-between text-sm font-medium mb-1 cursor-pointer select-none"
+              on:click={() => (personalNotesOpen = !personalNotesOpen)}
+            >
+              <span>Personal Notes</span>
+              <span class="text-xs text-zinc-400">
+                {personalNotesOpen ? 'Hide' : 'Show'}
+              </span>
+            </button>
+
+            {#if personalNotesOpen}
+              <div class="whitespace-pre-wrap text-sm rounded-md border border-zinc-800 bg-zinc-950 p-3">
+                {record.personal_notes}
+              </div>
+            {/if}
           </div>
         {/if}
       </section>
