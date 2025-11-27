@@ -714,12 +714,34 @@ def discogs_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str,
 
 @app.get("/api/discogs/search")
 def api_discogs_search(
-    artist: str = Query(...),
-    title: str = Query(...),
+    artist: str = Query(..., description="Artist name"),
+    # Frontend may send either `title` or `release_title`; support both.
+    title: Optional[str] = Query(
+        default=None,
+        description="Release title (frontend may use `title`)"
+    ),
+    release_title: Optional[str] = Query(
+        default=None,
+        alias="release_title",
+        description="Alternate param name used by the frontend / Discogs API"
+    ),
     year: Optional[int] = Query(default=None),
     barcode: Optional[str] = Query(default=None),
 ) -> Dict[str, Any]:
-    params: Dict[str, Any] = {"artist": artist, "release_title": title, "type": "release"}
+    """
+    Proxy to Discogs /database/search, but accept both `title` and
+    `release_title` as query parameters for backward compatibility.
+    """
+    # Prefer `title` if provided, otherwise fall back to `release_title`
+    effective_title = title or release_title
+
+    params: Dict[str, Any] = {
+        "artist": artist,
+        "type": "release",
+    }
+    if effective_title:
+        # Discogs expects `release_title` here
+        params["release_title"] = effective_title
     if year:
         params["year"] = year
     if barcode:

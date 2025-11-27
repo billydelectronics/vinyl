@@ -17,6 +17,14 @@ MODE="${1:-docker}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
+# Load .env if present (for DISCOGS_TOKEN, etc.)
+if [ -f "$ROOT/.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$ROOT/.env"
+  set +a
+fi
+
 VENV_PATH="$ROOT/.venv311"
 BACKEND_CONTAINER_NAME="vinyl_app"
 
