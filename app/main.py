@@ -496,6 +496,7 @@ def meta_import_template() -> Response:
         "format",
         "country",
         "location",
+        "sort_mode",
         "catalog_number",
         "barcode",
         "discogs_id",
@@ -506,7 +507,6 @@ def meta_import_template() -> Response:
         "cover_url_auto",
         "album_notes",
         "personal_notes",
-        "sort_mode",
     ]
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -519,7 +519,7 @@ def meta_import_template() -> Response:
     )
 
 
-@app.get("/api/records/export")
+@app.get("/api/records-export")
 def export_records() -> Response:
     conn = db()
     cur = conn.cursor()
@@ -536,6 +536,7 @@ def export_records() -> Response:
         "format",
         "country",
         "location",
+        "sort_mode",
         "catalog_number",
         "barcode",
         "discogs_id",
@@ -546,7 +547,8 @@ def export_records() -> Response:
         "cover_url_auto",
         "album_notes",
         "personal_notes",
-        "sort_mode",
+        "created_at",
+        "updated_at",
     ]
 
     buf = io.StringIO()

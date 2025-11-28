@@ -244,59 +244,40 @@
   // ---------- Export CSV (client-side; all columns) ----------
   let exportBusy = false;
 
-  async function exportCsv() {
-    if (!allRecords || allRecords.length === 0) {
-      alert('No records to export.');
-      return;
-    }
-
+    async function exportCsv() {
     exportBusy = true;
 
     try {
-      const headerSet = new Set<string>();
-      for (const row of allRecords) {
-        if (row && typeof row === 'object') {
-          for (const key of Object.keys(row as Record<string, unknown>)) {
-            headerSet.add(key);
-          }
-        }
+      const res = await fetch('/api/records-export', {
+        method: 'GET',
+        credentials: 'same-origin'
+      });
+
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(
+          `Export failed: HTTP ${res.status} ${res.statusText}${
+            text ? ` — ${text.slice(0, 200)}` : ''
+          }`
+        );
       }
 
-      const headers = Array.from(headerSet);
-      if (headers.length === 0) {
-        alert('No columns to export.');
-        return;
-      }
-
-      const escapeCsv = (value: unknown): string => {
-        if (value === null || value === undefined) return '';
-        const str = String(value);
-        if (/[",\n]/.test(str)) {
-          return `"${str.replace(/"/g, '""')}"`;
-        }
-        return str;
-      };
-
-      const lines: string[] = [];
-      lines.push(headers.join(','));
-
-      for (const row of allRecords) {
-        const line = headers
-          .map((key) => escapeCsv((row as Record<string, unknown>)[key]))
-          .join(',');
-        lines.push(line);
-      }
-
-      const csvContent = lines.join('\r\n');
-      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      const defaultName = `records_full_export_${new Date()
-        .toISOString()
-        .slice(0, 19)
-        .replace(/[:T]/g, '-')}.csv`;
+
+      // Try to respect filename from server, fallback to a default name
+      const dispo = res.headers.get('Content-Disposition') || '';
+      const match = dispo.match(/filename="?(.*?)"?$/i);
+      const filename =
+        (match && match[1]) ||
+        `vinyl_records_export_${new Date()
+          .toISOString()
+          .slice(0, 19)
+          .replace(/[:T]/g, '-')}.csv`;
+
       a.href = url;
-      a.download = defaultName;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
