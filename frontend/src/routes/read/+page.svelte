@@ -14,6 +14,8 @@
     cover_url?: string | null;
     cover_url_auto?: string | null;
     discogs_thumb?: string | null;
+    // new field used for artist sort behavior
+    sort_mode?: string | null; // "Band" | "Person" | null
   };
 
   export let data:
@@ -66,17 +68,37 @@
 
   const s = (v: unknown) => (v ?? '').toString().toLowerCase();
 
-  // Strip leading "the " (case-insensitive) for artist sort
-  function normalizeArtistForSort(name: unknown): string {
-    const v = s(name);
-    return v.startsWith('the ') ? v.slice(4) : v;
+  function stripThePrefix(name: string): string {
+    const trimmed = (name || '').trim();
+    if (trimmed.toLowerCase().startsWith('the ')) {
+      return trimmed.slice(4).trim();
+    }
+    return trimmed;
+  }
+
+  // Same logic as Utility:
+  // - ignore leading "The "
+  // - if sort_mode === "Person", rotate "First Last" -> "Last First"
+  function artistSortKey(r: RecordRow): string {
+    const base = stripThePrefix(r.artist || '');
+    const mode = (r.sort_mode || '').toLowerCase();
+
+    if (mode === 'person') {
+      const parts = base.split(/\s+/).filter(Boolean);
+      if (parts.length >= 2) {
+        const [first, ...rest] = parts;
+        return `${rest.join(' ')} ${first}`.toLowerCase();
+      }
+    }
+    return base.toLowerCase();
   }
 
   function baseCmp(a: RecordRow, b: RecordRow) {
-    // Use normalized artist for tie-breaking too
-    const aA = normalizeArtistForSort(a.artist);
-    const bA = normalizeArtistForSort(b.artist);
+    // tie-breaking uses the same normalized artist key
+    const aA = artistSortKey(a);
+    const bA = artistSortKey(b);
     if (aA !== bA) return aA > bA ? 1 : -1;
+
     const aT = s(a.title);
     const bT = s(b.title);
     if (aT !== bT) return aT > bT ? 1 : -1;
@@ -102,9 +124,9 @@
       let B: string;
 
       if (key === 'artist') {
-        // Ignore leading "The " when sorting by artist
-        A = normalizeArtistForSort(a.artist);
-        B = normalizeArtistForSort(b.artist);
+        // Use full artistSortKey logic (ignore "The ", rotate persons)
+        A = artistSortKey(a);
+        B = artistSortKey(b);
       } else {
         A = s((a as any)[key]);
         B = s((b as any)[key]);

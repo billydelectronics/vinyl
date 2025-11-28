@@ -9,6 +9,8 @@
     label: '',
     format: 'LP',    // default
     country: 'US',   // default
+    location: '',    // NEW
+    sort_mode: '',   // NEW
     catalog_number: '',
     barcode: '',
     cover_url: ''
@@ -22,6 +24,8 @@
     'label',
     'format',
     'country',
+    'location',    // NEW
+    'sort_mode',   // NEW
     'catalog_number',
     'barcode',
     'cover_url'
@@ -100,7 +104,7 @@
   </div>
 
   <div class="rounded-xl border border-zinc-800 bg-zinc-950/70 p-4 sm:p-6 space-y-6">
-    <!-- Core fields: Artist, Title, Year, Label, Format, Country, Catalog_number, Barcode, Cover_url -->
+    <!-- Core fields -->
     <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <!-- Artist -->
       <label class="flex flex-col gap-1">
@@ -171,6 +175,31 @@
           class="w-full rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500/70"
           type="text"
           bind:value={(draft['country'] as any)}
+        />
+      </label>
+
+      <!-- Location (NEW, after country) -->
+      <label class="flex flex-col gap-1">
+        <span class="text-xs font-medium uppercase tracking-wide text-zinc-400">
+          location
+        </span>
+        <input
+          class="w-full rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500/70"
+          type="text"
+          bind:value={(draft['location'] as any)}
+        />
+      </label>
+
+      <!-- sort_mode (NEW, after location) -->
+      <label class="flex flex-col gap-1">
+        <span class="text-xs font-medium uppercase tracking-wide text-zinc-400">
+          sort_mode
+        </span>
+        <input
+          class="w-full rounded-lg border border-zinc-700 bg-zinc-900/80 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500/70"
+          type="text"
+          bind:value={(draft['sort_mode'] as any)}
+          placeholder="Band or Person"
         />
       </label>
 

@@ -16,6 +16,9 @@
     cover_url?: string | null;
     cover_url_auto?: string | null;
     discogs_thumb?: string | null;
+    // newly used fields for sorting / future use
+    location?: string | null;
+    sort_mode?: string | null; // "Band" | "Person" | null
   };
 
   export let data:
@@ -41,9 +44,37 @@
 
   const s = (v: unknown) => (v ?? '').toString().toLowerCase();
 
+  function stripThePrefix(name: string): string {
+    const trimmed = (name || '').trim();
+    if (trimmed.toLowerCase().startsWith('the ')) {
+      return trimmed.slice(4).trim();
+    }
+    return trimmed;
+  }
+
+  // Compute the artist sort key:
+  // - ignore leading "The "
+  // - if sort_mode === "Person", rotate "First Last" → "Last First"
+  function artistSortKey(r: RecordRow): string {
+    const base = stripThePrefix(r.artist || '');
+    const mode = (r.sort_mode || '').toLowerCase();
+
+    if (mode === 'person') {
+      const parts = base.split(/\s+/).filter(Boolean);
+      if (parts.length >= 2) {
+        const [first, ...rest] = parts;
+        return `${rest.join(' ')} ${first}`.toLowerCase();
+      }
+    }
+
+    // default: band / null / anything else → just use base
+    return base.toLowerCase();
+  }
+
   function baseCmp(a: RecordRow, b: RecordRow) {
-    const aA = s(a.artist);
-    const bA = s(b.artist);
+    // primary tie-breaker: artist using the same normalized key
+    const aA = artistSortKey(a);
+    const bA = artistSortKey(b);
     if (aA !== bA) return aA > bA ? 1 : -1;
 
     const aT = s(a.title);
@@ -73,6 +104,23 @@
     });
 
     rows = rows.slice().sort((a, b) => {
+      // special handling when Sort by = Artist
+      if (key === 'artist') {
+        const A = artistSortKey(a);
+        const B = artistSortKey(b);
+
+        if (A !== B) {
+          if (dir === 'asc') {
+            return A > B ? 1 : -1;
+          } else {
+            return A < B ? 1 : -1;
+          }
+        }
+        // fall back to baseCmp if artist keys are equal
+        return baseCmp(a, b);
+      }
+
+      // default behavior for Title / Year
       const A = s((a as any)[key]);
       const B = s((b as any)[key]);
       if (A !== B) {

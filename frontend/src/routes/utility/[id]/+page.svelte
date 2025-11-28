@@ -20,6 +20,7 @@
     label?: string | null;
     format?: string | null;
     country?: string | null;
+    location?: string | null;
     catalog_number?: string | null;
     barcode?: string | null;
     discogs_id?: number | null;
@@ -30,6 +31,7 @@
     cover_url_auto?: string | null;  // auto from Discogs
     album_notes?: string | null;
     personal_notes?: string | null;
+    sort_mode?: string | null;
   };
 
   // ---- Route param ----
@@ -86,6 +88,7 @@
       label: t(r.label),
       format: t(r.format),
       country: t(r.country),
+      location: t(r.location),
       catalog_number: t(r.catalog_number),
       barcode: t(r.barcode),
       discogs_id: r.discogs_id ?? null,
@@ -95,7 +98,8 @@
       cover_local: t(r.cover_local),
       cover_url_auto: t(r.cover_url_auto),
       album_notes: t(r.album_notes),
-      personal_notes: t(r.personal_notes)
+      personal_notes: t(r.personal_notes),
+      sort_mode: t(r.sort_mode)
     };
   }
   function normalizeForPatch(d: RecordRow): Partial<RecordRow> {
@@ -108,6 +112,7 @@
       label: nz(d.label),
       format: nz(d.format),
       country: nz(d.country),
+      location: nz(d.location),
       catalog_number: nz(d.catalog_number),
       barcode: nz(d.barcode),
       discogs_id: num(d.discogs_id as any),
@@ -117,7 +122,8 @@
       cover_local: nz(d.cover_local),
       cover_url_auto: nz(d.cover_url_auto),
       album_notes: nz(d.album_notes),
-      personal_notes: nz(d.personal_notes)
+      personal_notes: nz(d.personal_notes),
+      sort_mode: nz(d.sort_mode)
     };
   }
   function diffPatch(before: RecordRow, after: RecordRow) {
@@ -412,6 +418,15 @@
             <div class="mb-1 text-gray-400">Country</div>
             <input id="country" class="w-full px-3 py-1.5 rounded-md bg-gray-900 border border-gray-700" bind:value={draft.country} />
           </label>
+          <label class="text-sm" for="location">
+            <div class="mb-1 text-gray-400">Location</div>
+            <input
+              id="location"
+              class="w-full px-3 py-1.5 rounded-md bg-gray-900 border border-gray-700"
+              bind:value={draft.location}
+              placeholder="Shelf, box, room…"
+            />
+          </label>
           <label class="text-sm" for="catno">
             <div class="mb-1 text-gray-400">Catalog #</div>
             <input id="catno" class="w-full px-3 py-1.5 rounded-md bg-gray-900 border border-gray-700" bind:value={draft.catalog_number} />
@@ -438,6 +453,15 @@
             <div class="mb-1 text-gray-400">Personal notes</div>
             <textarea id="personal-notes" class="w-full min-h-[120px] rounded-md border border-gray-700 bg-gray-900 p-2"
             bind:value={draft.personal_notes}></textarea>
+          </label>
+          <label class="text-sm md:col-span-2" for="sort-mode">
+            <div class="mb-1 text-gray-400">Sort mode</div>
+            <input
+              id="sort-mode"
+              class="w-full px-3 py-1.5 rounded-md bg-gray-900 border border-gray-700"
+              bind:value={draft.sort_mode}
+              placeholder="Optional per-record sort override"
+            />
           </label>
         </div>
       </div>

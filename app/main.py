@@ -110,6 +110,7 @@ def init_db() -> None:
           cover_url_auto TEXT,
           album_notes TEXT,
           personal_notes TEXT,
+          sort_mode TEXT,
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
           updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -279,6 +280,7 @@ class RecordIn(BaseModel):
     cover_url_auto: Optional[str] = None
     album_notes: Optional[str] = None
     personal_notes: Optional[str] = None
+    sort_mode: Optional[str] = None
 
 
 class RecordPatch(BaseModel):
@@ -299,6 +301,7 @@ class RecordPatch(BaseModel):
     cover_url_auto: Optional[str] = None
     album_notes: Optional[str] = None
     personal_notes: Optional[str] = None
+    sort_mode: Optional[str] = None
 
 
 class TrackIn(BaseModel):
@@ -503,6 +506,7 @@ def meta_import_template() -> Response:
         "cover_url_auto",
         "album_notes",
         "personal_notes",
+        "sort_mode",
     ]
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -542,6 +546,7 @@ def export_records() -> Response:
         "cover_url_auto",
         "album_notes",
         "personal_notes",
+        "sort_mode",
     ]
 
     buf = io.StringIO()
@@ -655,6 +660,8 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
                 rec["album_notes"] = nz(val)
             elif key == "personal_notes":
                 rec["personal_notes"] = nz(val)
+            elif key == "sort_mode":
+                rec["sort_mode"] = nz(val)
 
         artist = nz(rec.get("artist"))
         title = nz(rec.get("title"))
