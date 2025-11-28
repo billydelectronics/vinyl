@@ -15,6 +15,7 @@
     title: string;
     year?: number | null;
     label?: string | null;
+    location?: string | null;
     catalog_number?: string | null;
     barcode?: string | null;
 
