@@ -598,10 +598,29 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
         return str(s).strip()
 
     raw_bytes = await file.read()
-    try:
-        text = raw_bytes.decode("utf-8-sig")
-    except Exception:
-        raise HTTPException(400, detail="Could not decode CSV as UTF-8")
+
+    def decode_csv_bytes(b: bytes) -> str:
+        # Handle common encodings produced by Excel/Numbers/Sheets exports.
+        # Order matters: try UTFs first, then Windows-1252 as a pragmatic fallback.
+        if not b:
+            return ""
+        # UTF-16 BOM sniff
+        if b.startswith(b"\xff\xfe") or b.startswith(b"\xfe\xff"):
+            try:
+                return b.decode("utf-16")
+            except Exception:
+                pass
+        for enc in ("utf-8-sig", "utf-8", "cp1252", "cp1250", "latin-1"):
+            try:
+                return b.decode(enc)
+            except Exception:
+                continue
+        raise HTTPException(
+            400,
+            detail="Could not decode CSV (tried UTF-8/UTF-16/Windows-1252). Please export as CSV UTF-8.",
+        )
+
+    text = decode_csv_bytes(raw_bytes)
 
     reader = csv.reader(io.StringIO(text))
     try:
@@ -686,7 +705,7 @@ async def import_csv(file: UploadFile = File(...)) -> Dict[str, Any]:
         db_insert_record(rec)
         rows_imported += 1
 
-    return {"imported": rows_imported}
+    return {"added": rows_imported, "imported": rows_imported}
 
 
 # =============================================================================

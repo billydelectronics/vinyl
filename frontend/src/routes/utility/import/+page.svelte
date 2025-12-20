@@ -110,7 +110,7 @@
 
       const json = await res.json();
 
-      const added = json?.added ?? json?.created ?? json?.count ?? 0;
+      const added = json?.added ?? json?.imported ?? json?.created ?? json?.count ?? 0;
       const skipped = json?.skipped ?? json?.duplicates ?? 0;
       const updated = json?.updated ?? 0;
 
