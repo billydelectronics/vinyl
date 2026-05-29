@@ -19,20 +19,20 @@
   };
 
   export let data:
-    | { records?: RecordRow[]; sortKey?: 'title' | 'artist' | 'year'; sortDir?: 'asc' | 'desc' }
+    | { records?: RecordRow[]; sortKey?: 'artist' | 'title' | 'year'; sortDir?: 'asc' | 'desc' }
     | undefined;
 
   // ---------- State ----------
   let allRecords: RecordRow[] = data?.records ?? [];
   // Default sort is artist
-  let sortKey: 'title' | 'artist' | 'year' = data?.sortKey ?? 'artist';
+  let sortKey: 'artist' | 'title' | 'year' = data?.sortKey ?? 'artist';
   let sortDir: 'asc' | 'desc' = data?.sortDir ?? 'asc';
   let search = '';
   let view: 'grid' | 'list' = 'grid';
   let page = 1;
   let pageSize: 'ALL' | '24' | '48' | '96' = 'ALL';
 
-  const STATE_KEY = 'readSearchState_v3';
+  const STATE_KEY = 'readSearchState_v4';
   const PAGE_SIZES: Record<'24' | '48' | '96', number> = {
     '24': 24,
     '48': 48,

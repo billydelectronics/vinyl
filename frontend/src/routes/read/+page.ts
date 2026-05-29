@@ -8,7 +8,7 @@ export const load: PageLoad = async ({ fetch, url }) => {
   const data = r.ok ? await r.json() : [];
   const arr = Array.isArray(data) ? data : (Array.isArray(data?.items) ? data.items : []);
 
-  const sortKey = (url.searchParams.get('sort') ?? 'title') as 'title' | 'artist' | 'year';
+  const sortKey = (url.searchParams.get('sort') ?? 'artist') as 'title' | 'artist' | 'year';
   const sortDir = url.searchParams.get('dir') === 'desc' ? 'desc' : 'asc';
 
   const sorted = [...arr].sort((a: any, b: any) => {
