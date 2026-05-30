@@ -244,7 +244,7 @@
   // ---------- Export CSV (client-side; all columns) ----------
   let exportBusy = false;
 
-    async function exportCsv() {
+  async function exportCsv() {
     exportBusy = true;
 
     try {
@@ -292,6 +292,8 @@
   // ---------- Cover embedding tools ----------
   let coverRebuildBusy = false;
   let coverMissingBusy = false;
+  let coverEmbeddingStatus = '';
+  let coverEmbeddingError = '';
 
   const COVER_REBUILD_URL = '/api/cover-embeddings/rebuild';
   const COVER_BUILD_MISSING_URL = '/api/cover-embeddings/build-missing';
@@ -320,21 +322,30 @@
         data = JSON.parse(text);
       } catch {
         // If parsing fails, fall back to raw text
-        alert(`Rebuild complete.\n\nRaw response:\n${text}`);
+        //alert(`Rebuild complete.\n\nRaw response:\n${text}`);
+        coverEmbeddingError = '';
+        coverEmbeddingStatus = `Rebuild complete — ${text}`;
         return;
       }
 
       // Expected shape: { processed: N, skipped_no_image: M, errors: X }
       const { processed, skipped_no_image, errors } = data;
-
+/*
       alert(
         `Rebuild complete:\n\n` +
           `Processed: ${processed}\n` +
           `Skipped (no image): ${skipped_no_image}\n` +
           `Errors: ${errors}`
       );
+*/
+      coverEmbeddingError = '';
+      coverEmbeddingStatus =
+        `Rebuild complete — Processed: ${processed}, ` +
+        `Skipped no image: ${skipped_no_image}, Errors: ${errors}`;
     } catch (e: any) {
-      alert(e?.message ?? 'Failed to rebuild cover embeddings.');
+      // alert(e?.message ?? 'Failed to rebuild cover embeddings.');
+      coverEmbeddingStatus = '';
+      coverEmbeddingError = e?.message ?? 'Failed to rebuild cover embeddings.';
     } finally {
       coverRebuildBusy = false;
     }
@@ -363,21 +374,30 @@
       try {
         data = JSON.parse(text);
       } catch {
-        alert(`Build complete.\n\nRaw response:\n${text}`);
+        // alert(`Build complete.\n\nRaw response:\n${text}`);
+        coverEmbeddingError = '';
+        coverEmbeddingStatus = `Build complete — ${text}`;
         return;
       }
 
       // Expected structure: { processed, skipped_no_image, errors }
       const { processed, skipped_no_image, errors } = data;
-
+/*
       alert(
         `Build missing cover embeddings complete:\n\n` +
           `Processed: ${processed}\n` +
           `Skipped (no image): ${skipped_no_image}\n` +
           `Errors: ${errors}`
       );
+*/
+      coverEmbeddingError = '';
+      coverEmbeddingStatus =
+        `Build missing complete — Processed: ${processed}, ` +
+        `Skipped no image: ${skipped_no_image}, Errors: ${errors}`;
     } catch (e: any) {
-      alert(e?.message ?? 'Failed to build missing cover embeddings.');
+      // alert(e?.message ?? 'Failed to build missing cover embeddings.');
+      coverEmbeddingStatus = '';
+      coverEmbeddingError = e?.message ?? 'Failed to build missing cover embeddings.';
     } finally {
       coverMissingBusy = false;
     }
@@ -407,6 +427,7 @@
 
       <div class="flex flex-wrap items-center gap-2">
         <button
+          type="button"
           class="px-3 py-1.5 rounded-lg border border-white/20 bg-transparent text-white hover:bg-white/5"
           on:click={goAdd}
         >
@@ -414,6 +435,7 @@
         </button>
 
         <button
+          type="button"
           class="px-3 py-1.5 rounded-lg border border-emerald-400/40 bg-emerald-500/10 text-emerald-100 hover:bg-emerald-500/20"
           on:click={goImport}
         >
@@ -421,6 +443,7 @@
         </button>
 
         <button
+          type="button"
           class="px-3 py-1.5 rounded-lg border border-white/20 bg-transparent text-white hover:bg-white/5 disabled:opacity-50"
           disabled={exportBusy || loading || !allRecords.length}
           on:click={exportCsv}
@@ -430,6 +453,7 @@
 
         <!-- Embedding tools in nav bar -->
         <button
+          type="button"
           class="px-3 py-1.5 rounded-lg border border-indigo-400/60 bg-indigo-500/10 text-indigo-100 hover:bg-indigo-500/20 disabled:opacity-50 text-sm"
           on:click={rebuildAllCoverEmbeddings}
           disabled={coverRebuildBusy || coverMissingBusy}
@@ -438,6 +462,7 @@
         </button>
 
         <button
+          type="button"
           class="px-3 py-1.5 rounded-lg border border-sky-400/60 bg-sky-500/10 text-sky-100 hover:bg-sky-500/20 disabled:opacity-50 text-sm"
           on:click={buildMissingCoverEmbeddings}
           disabled={coverRebuildBusy || coverMissingBusy}
@@ -446,6 +471,20 @@
         </button>
       </div>
     </div>
+    {#if coverEmbeddingStatus || coverEmbeddingError}
+      <div class="max-w-7xl mx-auto px-4 pb-3 text-sm">
+        {#if coverEmbeddingStatus}
+          <div class="rounded-lg border border-emerald-500/30 bg-emerald-500/10 text-emerald-100 px-3 py-2">
+            {coverEmbeddingStatus}
+          </div>
+        {/if}
+        {#if coverEmbeddingError}
+          <div class="rounded-lg border border-red-500/30 bg-red-500/10 text-red-100 px-3 py-2">
+            {coverEmbeddingError}
+          </div>
+        {/if}
+      </div>
+    {/if}
   </div>
 
   <!-- Controls Bar -->
@@ -485,6 +524,7 @@
       </div>
 
       <button
+        type="button"
         class="ml-auto px-3 py-2 rounded-lg border border-rose-500/60 bg-rose-500/10 text-rose-100 hover:bg-rose-500/20 disabled:opacity-50"
         disabled={!rows.length || !selectedIds.size || deleteBusy}
         on:click={bulkDelete}
@@ -570,6 +610,7 @@
                 <td class="p-3 align-middle text-gray-300">{r.year ?? ''}</td>
                 <td class="p-3 align-middle">
                   <button
+                    type="button"
                     class="px-2 py-1 rounded-lg border border-gray-700 bg-gray-800 hover:bg-gray-700 text-gray-100"
                     on:click={() => editRow(r.id)}
                   >
