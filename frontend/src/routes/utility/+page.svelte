@@ -299,8 +299,9 @@
   const COVER_BUILD_MISSING_URL = '/api/cover-embeddings/build-missing';
 
   async function rebuildAllCoverEmbeddings() {
-    if (!confirm('Rebuild cover embeddings for ALL records? This may take a while.')) return;
-
+    // if (!confirm('Rebuild cover embeddings for ALL records? This may take a while.')) return;
+    coverEmbeddingStatus = '';
+    coverEmbeddingError = '';
     coverRebuildBusy = true;
     try {
       const res = await fetch(COVER_REBUILD_URL, {
@@ -352,8 +353,9 @@
   }
 
   async function buildMissingCoverEmbeddings() {
-    if (!confirm('Build cover embeddings only for records that are missing them?')) return;
-
+    // if (!confirm('Build cover embeddings only for records that are missing them?')) return;
+    coverEmbeddingStatus = '';
+    coverEmbeddingError = '';
     coverMissingBusy = true;
     try {
       const res = await fetch(COVER_BUILD_MISSING_URL, {
